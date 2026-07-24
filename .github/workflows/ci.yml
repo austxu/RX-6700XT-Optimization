@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - "release/**"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: Publication checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify public evidence and regenerated statistics
+        run: scripts/linux/reproduce_public_release.sh analysis
+
+      - name: Verify patch manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          for manifest in patches/*/SHA256SUMS; do
+            (
+              cd "$(dirname "$manifest")"
+              sha256sum --check SHA256SUMS
+            )
+          done
+
+      - name: Check publication tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            scripts/analyze_release_evidence.py \
+            scripts/release_statistics.py
+          bash -n \
+            scripts/apply_llamacpp_navi22_patches.sh \
+            scripts/apply_llamacpp_navi22_retained_0cea36222.sh \
+            scripts/apply_llamacpp_navi22_retained_a551.sh \
+            scripts/linux/build_public_llamacpp.sh \
+            scripts/linux/reproduce_public_release.sh
+          python3 -m json.tool \
+            release/protocols/llama2-q4_0-rx6700xt-scoreboard-20260724.json \
+            >/dev/null

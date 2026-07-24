@@ -1,0 +1,207 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: austxu <austxu@users.noreply.github.com>
+Date: Thu, 16 Jul 2026 19:02:35 -0700
+Subject: [PATCH 5/9] vulkan: add Navi22 Q4_0 wave64 rows2 route
+
+Reuse the stock integer-dot MMVQ shader with two output rows per wave64 workgroup. Keep the lane partition and reduction tree unchanged, gate the opt-in route to the verified Navi22/RADV capabilities, and report actual dispatch coverage.
+
+Add deterministic Q4_0 whole-graph fixtures for the exact Llama 2 down-projection and vocabulary shapes.
+
+Assisted-by: Codex <noreply@openai.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 75 +++++++++++++++++++++++++++-
+ tests/test-backend-ops.cpp           | 39 +++++++++++++++
+ 2 files changed, 113 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 4c3715327a8d5e588454d4aed39422597e59cdef..5c07bed951e00152ac8d7ed8ac81999675a0bdf3 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -747,6 +747,9 @@ struct vk_device_struct {
+     int32_t mmvq_mode;
+     bool q4_k_mmvq_navi22 {};
+     std::atomic<bool> q4_k_mmvq_navi22_banner_logged {};
++    bool q4_0_mmvq_navi22 {};
++    std::atomic<bool> q4_0_mmvq_navi22_banner_logged {};
++    std::atomic<bool> q4_0_mmvq_navi22_diagnostic_logged {};
+     bool rms_norm_mul_q8_1_navi22 {};
+     std::atomic<bool> rms_norm_mul_q8_1_navi22_diagnostic_logged {};
+ 
+@@ -2207,6 +2210,7 @@ struct ggml_backend_vk_context {
+     uint32_t rms_norm_mul_q8_1_q4_k_dispatches {};
+     uint32_t rms_norm_mul_q8_1_partial_dispatches {};
+     uint32_t rms_norm_mul_q8_1_direct_dispatches {};
++    uint32_t q4_0_mmvq_navi22_dispatches {};
+     topk_moe_mode fused_topk_moe_mode {};
+     bool fused_topk_moe_scale {};
+ 
+@@ -5023,7 +5027,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                 const uint32_t wg_size_subgroup_int = (w == DMMV_WG_SIZE_SUBGROUP) ? subgroup_size_int : (subgroup_size_int * 4);
+ 
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_q8_1_f32", arr_dmmv_q2_0_q8_1_f32_len[reduc], arr_dmmv_q2_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_q8_1_f32", arr_dmmv_q4_0_q8_1_f32_len[reduc], arr_dmmv_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
++                if (device->q4_0_mmvq_navi22 && w == DMMV_WG_SIZE_SUBGROUP && i == 0) {
++                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_q8_1_f32_navi22_rows2", arr_dmmv_q4_0_q8_1_f32_len[reduc], arr_dmmv_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {64, 2, 1}, 1, true, true, 64);
++                } else {
++                    ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_q8_1_f32", arr_dmmv_q4_0_q8_1_f32_len[reduc], arr_dmmv_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
++                }
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_1][i], "mul_mat_vec_q4_1_q8_1_f32", arr_dmmv_q4_1_q8_1_f32_len[reduc], arr_dmmv_q4_1_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_0][i], "mul_mat_vec_q5_0_q8_1_f32", arr_dmmv_q5_0_q8_1_f32_len[reduc], arr_dmmv_q5_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q5_1][i], "mul_mat_vec_q5_1_q8_1_f32", arr_dmmv_q5_1_q8_1_f32_len[reduc], arr_dmmv_q5_1_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+@@ -5877,6 +5885,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             !device->q4_k_mmvq_navi22_banner_logged.exchange(true)) {
+             fprintf(stderr, "ggml_vulkan: selected Q4_K x Q8_1 Navi22 MMVQ route (n=1, wave32, 2 rows/workgroup)\n");
+         }
++        if (task.pipeline->name == "mul_mat_vec_q4_0_q8_1_f32_navi22_rows2" &&
++            !device->q4_0_mmvq_navi22_banner_logged.exchange(true)) {
++            fprintf(stderr, "ggml_vulkan: selected Q4_0 x Q8_1 Navi22 MMVQ route (n=1, wave64, 2 rows/workgroup)\n");
++        }
+     }
+ 
+     // Another thread may be compiling the pipeline we need; block on it here.
+@@ -6691,6 +6703,53 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             device->q4_k_mmvq_navi22 = true;
+         }
+ 
++        const char * q4_0_mmvq_navi22_env = getenv("GGML_VK_Q4_0_MMVQ_NAVI22");
++        if (getenv("GGML_VK_Q4_0_MMVQ_NAVI22_MODE") != nullptr ||
++            getenv("GGML_VK_Q4_0_MMVQ_NAVI22_ROWS") != nullptr ||
++            getenv("GGML_VK_Q4_0_MMVQ_NAVI22_CONTRACTION") != nullptr) {
++            GGML_LOG_ERROR("ggml_vulkan: legacy Q4_0 Navi22 MMVQ mode/rows/contraction selectors are unsupported\n");
++            throw std::runtime_error("legacy Q4_0 Navi22 MMVQ mode/rows/contraction selectors are unsupported");
++        }
++        if (q4_0_mmvq_navi22_env != nullptr) {
++            const char * rejection_reason = nullptr;
++            if (strcmp(q4_0_mmvq_navi22_env, "1") != 0) {
++                rejection_reason = "the environment value must be exactly 1";
++            } else if (getenv("GGML_VK_FORCE_MMVQ") != nullptr ||
++                       getenv("GGML_VK_DISABLE_MMVQ") != nullptr) {
++                rejection_reason = "GGML_VK_FORCE_MMVQ and GGML_VK_DISABLE_MMVQ must be unset";
++            } else if (device->vendor_id != VK_VENDOR_ID_AMD ||
++                       device->properties.deviceID != navi22_rx_6700_xt_device_id) {
++                rejection_reason = "the selected device is not an AMD Radeon RX 6700 XT (device ID 0x73df)";
++            } else if (device->architecture != vk_device_architecture::AMD_RDNA2) {
++                rejection_reason = "the selected device was not detected as RDNA2";
++            } else if (device->driver_id != vk::DriverId::eMesaRadv) {
++                rejection_reason = "the selected Vulkan driver is not Mesa RADV";
++            } else if (!device->integer_dot_product) {
++                rejection_reason = "accelerated signed packed 4x8-bit integer dot product is unavailable";
++            } else if (!device->subgroup_basic || !device->subgroup_arithmetic) {
++                rejection_reason = "compute-stage subgroup basic/arithmetic operations are unavailable";
++            } else if (!device->subgroup_size_control ||
++                       device->subgroup_min_size > 64 ||
++                       device->subgroup_max_size < 64) {
++                rejection_reason = "a required subgroup size of 64 is unavailable";
++            } else if (!device->subgroup_require_full_support) {
++                rejection_reason = "full compute subgroups are unavailable";
++            } else if (device->properties.limits.maxComputeWorkGroupInvocations < 64 ||
++                       device->properties.limits.maxComputeWorkGroupSize[0] < 64) {
++                rejection_reason = "a 64-invocation compute workgroup is unavailable";
++#if !defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
++            } else {
++                rejection_reason = "this build does not contain integer-dot-product Vulkan shaders";
++#endif
++            }
++
++            if (rejection_reason != nullptr) {
++                GGML_LOG_ERROR("ggml_vulkan: GGML_VK_Q4_0_MMVQ_NAVI22 rejected: %s\n", rejection_reason);
++                throw std::runtime_error(std::string("GGML_VK_Q4_0_MMVQ_NAVI22 rejected: ") + rejection_reason);
++            }
++            device->q4_0_mmvq_navi22 = true;
++        }
++
+         const char * rms_norm_mul_q8_1_navi22_env = getenv("GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22");
+         const char * rms_norm_mul_q8_1_navi22_mode_env = getenv("GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22_MODE");
+         if (rms_norm_mul_q8_1_navi22_env != nullptr) {
+@@ -9528,6 +9587,9 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+                                     d_F1,
+                                   },
+                                   pc, { groups_x, groups_y, groups_z });
++        if (dmmv->name == "mul_mat_vec_q4_0_q8_1_f32_navi22_rows2") {
++            ++ctx->q4_0_mmvq_navi22_dispatches;
++        }
+         base_work_group_y += groups_y;
+     }
+ 
+@@ -16867,6 +16929,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     ctx->rms_norm_mul_q8_1_q4_k_dispatches = 0;
+     ctx->rms_norm_mul_q8_1_partial_dispatches = 0;
+     ctx->rms_norm_mul_q8_1_direct_dispatches = 0;
++    ctx->q4_0_mmvq_navi22_dispatches = 0;
+ 
+     // On weaker AMD GPUs larger submissions can hit a driver timeout, submit more often to avoid this
+     if (ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->shader_core_count > 0) {
+@@ -17178,6 +17241,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+             ctx->rms_norm_mul_q8_1_q4_k_dispatches);
+     }
+ 
++    if (ctx->device->q4_0_mmvq_navi22 &&
++        ctx->q4_0_mmvq_navi22_dispatches != 0 &&
++        !ctx->device->q4_0_mmvq_navi22_diagnostic_logged.exchange(true)) {
++        fprintf(
++            stderr,
++            "ggml_vulkan: Q4_0 x Q8_1 Navi22 MMVQ coverage "
++            "(n=1 wave64 rows_per_workgroup=2 dispatches=%u)\n",
++            ctx->q4_0_mmvq_navi22_dispatches);
++    }
++
+     if (vk_perf_logger_enabled) {
+         // End the command buffer and submit/wait
+         GGML_ASSERT(!ctx->compute_ctx.expired());
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index da93719eb476f01a5346bff32a4cf839c75449a9..7694ca3245dde0be728dc1e31a09314060bee552 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3629,6 +3629,43 @@ struct test_rms_norm_mul_q4_0_mul_mat : public test_case {
+ 
+     bool run_whole_graph() override { return true; }
+ 
++    static uint32_t tensor_seed(const ggml_tensor * t) {
++        uint32_t seed = 2166136261u;
++        for (const char * p = ggml_get_name(t); *p; ++p) {
++            seed ^= (uint8_t) *p;
++            seed *= 16777619u;
++        }
++        for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++            seed ^= (uint32_t) t->ne[i];
++            seed *= 16777619u;
++        }
++        return seed;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            const size_t nels = ggml_nelements(t);
++            std::mt19937 rng(tensor_seed(t));
++            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
++            std::vector<float> data(nels);
++            for (float & value : data) {
++                value = dist(rng);
++            }
++
++            if (t->type == GGML_TYPE_F32) {
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
++            } else if (t->type == GGML_TYPE_Q4_0) {
++                const size_t blck_size = ggml_blck_size(t->type);
++                GGML_ASSERT(nels % blck_size == 0);
++                std::vector<uint8_t> dataq(ggml_row_size(t->type, nels));
++                ggml_quantize_chunk(t->type, data.data(), dataq.data(), 0, nels/blck_size, blck_size, nullptr);
++                ggml_backend_tensor_set(t, dataq.data(), 0, dataq.size());
++            } else {
++                GGML_ABORT("unexpected tensor type in deterministic Q4_0 whole-graph test");
++            }
++        }
++    }
++
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+         ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
+@@ -8788,6 +8825,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, output_rows));
+     }
+     test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 11008));
++    test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(11008, 4096));
++    test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 32000));
+     test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(14336, 33));
+     test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 4096, 1, true));
+     test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 33, 1, false, 2));

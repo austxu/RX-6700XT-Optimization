@@ -1,0 +1,106 @@
+{
+  "campaigns": {
+    "llama2-attention": {
+      "analyzer": "scripts/analyze_public_release_llama2.py",
+      "artifact_root": "artifacts/public-release/phase5/llama2-attention-abba-20260717T224044Z",
+      "claim_scope": "author-operated matched local benchmark",
+      "exported_files": [
+        "analysis.json",
+        "campaign.txt",
+        "raw-results.jsonl",
+        "raw-samples.csv",
+        "source-files.sha256"
+      ],
+      "raw_sample_count": 336,
+      "result_json_count": 12,
+      "result_row_count": 4,
+      "root_manifest_sha256": "645ce196c11efe0d730f2d19490e23cca674f93cd84311de3aa94462ac29e495",
+      "source_root_sealed": true
+    },
+    "llama2-retained-a551": {
+      "analyzer": "scripts/analyze_public_release_llama2.py",
+      "artifact_root": "artifacts/public-release/phase6/llama2-retained-a551-abba-20260721T025858Z",
+      "claim_scope": "author-operated matched local benchmark",
+      "exported_files": [
+        "analysis.json",
+        "campaign.txt",
+        "raw-results.jsonl",
+        "raw-samples.csv",
+        "source-files.sha256"
+      ],
+      "raw_sample_count": 336,
+      "result_json_count": 12,
+      "result_row_count": 4,
+      "root_manifest_sha256": "ba78604dd1d73a44f4f9bbb7afe14e91b23f0e5740d2f15f4ad0d1269427633d",
+      "scoreboard_eligibility_note": "The measured candidate is a custom retained-a551 fork. The discussion's main post does not explicitly require master, but llama.cpp collaborator 0cc4m later said the thread is for master-branch performance. The result is outside that stated scope unless a curator explicitly grants an exception.",
+      "scoreboard_submission_eligible": false,
+      "source_root_sealed": true
+    }
+  },
+  "claim_policy": "Results are author-operated matched local measurements unless a campaign explicitly states otherwise; they are not official scoreboard submissions or independent reproductions.",
+  "correctness_outcomes": {
+    "llama2": {
+      "artifact_root": "artifacts/public-release/current-master/correctness/llama2-20260724T065633Z",
+      "decision": "fail",
+      "evidence_status": "sealed",
+      "exported_campaign_sha256": "88d67fedfbc11335501d7cfbb692e8d4366e78ff9297b194bdb4cfe00e2ae09b",
+      "exported_files": [
+        "campaign.txt",
+        "source-files.sha256",
+        "summary.json"
+      ],
+      "exported_summary_sha256": "164b6d674c94bc2b244c988889f68fbe14115e7827d775d389d29b882d5b0258",
+      "failure_class": "numerical-correctness",
+      "failure_count": 12,
+      "performance_timing_authorized": false,
+      "profile": "llama2",
+      "source_campaign_sha256": "6ed62c68c46b090d7fda5e29919c3e157dc7ef2e52270a623e576ef8f3b73ff9",
+      "source_root_manifest_sha256": "78dac576e71305ee1810772cd0e9c499769a24178d23df545121d055157d24c2",
+      "source_root_sealed": true,
+      "source_summary_sha256": "13543e2e55c4bf4fb53f82b71ba524814c98cc7eb0939578e56e38ca6e723a9f"
+    }
+  },
+  "counts": {
+    "campaigns": 2,
+    "correctness_outcomes": 1,
+    "raw_samples": 672,
+    "result_json": 24,
+    "result_rows": 8,
+    "sealed_correctness_failures": 1,
+    "unsealed_route_failures": 0
+  },
+  "path_normalization": {
+    "${AMD_HWMON}": "RX 6700 XT hwmon directory",
+    "${AMD_PCI_DEVICE}": "RX 6700 XT PCI sysfs directory",
+    "${HOME}": "local user home",
+    "${REPO}": "repository root",
+    "${XDG_RUNTIME_DIR}": "per-user runtime directory",
+    "0x<LOAD_ADDRESS>": "dynamic-loader ASLR address"
+  },
+  "schema": "amd-inference-public-evidence-v2",
+  "snapshot_utc": "2026-07-24T07:11:00Z",
+  "supporting_evidence": {
+    "final-correctness": {
+      "artifact_root": "artifacts/public-release/release/final-correctness-20260718T004000Z",
+      "exported_source_seal": "supporting/final-correctness-source-files.sha256",
+      "root_manifest_sha256": "c3e4e52c67c8524b6af9db02cf2375e775424d7a519867f79f086fe7527e41a9",
+      "source_root_sealed": true
+    },
+    "hardware": {
+      "artifact_source": "artifacts/public-release/phase1/historical-evidence-20260716T202738Z/hardware-supplement-20260716T2029Z.txt",
+      "source_sha256": "08a8aa8dca574fb75ee1be15e686953100fcfeb100e897e83cb06ae76f7b7e44"
+    },
+    "retained-a551-correctness": {
+      "artifact_root": "artifacts/public-release/phase6/q4-down-prefetch-correctness-20260720T062412Z",
+      "exported_source_seal": "supporting/retained-a551-correctness-source-files.sha256",
+      "root_manifest_sha256": "ad8779feea6ac21c9fc63343b6133d75d3bc8accee76e9db0577ad318825eac6",
+      "source_root_sealed": true
+    },
+    "retained-a551-preflight": {
+      "artifact_root": "artifacts/public-release/phase6/llama2-retained-a551-abba-preflight-20260721T025813Z",
+      "exported_source_seal": "supporting/retained-a551-preflight-source-files.sha256",
+      "root_manifest_sha256": "fb13f54aa10bbe2be18152703f681db1c0c95169038af5d6001a0819549dc0c5",
+      "source_root_sealed": true
+    }
+  }
+}

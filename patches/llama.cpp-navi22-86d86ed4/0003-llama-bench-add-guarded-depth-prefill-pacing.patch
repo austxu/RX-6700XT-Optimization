@@ -1,0 +1,260 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: austxu <austxu@users.noreply.github.com>
+Date: Thu, 16 Jul 2026 14:56:22 -0700
+Subject: [PATCH 3/9] llama-bench: add guarded depth prefill pacing
+
+Assisted-by: OpenAI Codex
+---
+ tools/llama-bench/llama-bench.cpp | 156 +++++++++++++++++++++++++++++-
+ 1 file changed, 151 insertions(+), 5 deletions(-)
+
+diff --git a/tools/llama-bench/llama-bench.cpp b/tools/llama-bench/llama-bench.cpp
+index 0756893881ff04ac7e45b61e1d8b12eccf299d45..b6abf58148a1f7f7d64b69c0949e78278581ec36 100644
+--- a/tools/llama-bench/llama-bench.cpp
++++ b/tools/llama-bench/llama-bench.cpp
+@@ -1,6 +1,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cassert>
++#include <cerrno>
+ #include <chrono>
+ #include <cinttypes>
+ #include <clocale>
+@@ -10,6 +11,7 @@
+ #include <cstring>
+ #include <ctime>
+ #include <iterator>
++#include <limits>
+ #include <map>
+ #include <numeric>
+ #include <regex>
+@@ -41,6 +43,35 @@ static uint64_t get_time_ns() {
+     return std::chrono::nanoseconds(clock::now().time_since_epoch()).count();
+ }
+ 
++static bool parse_bounded_u64_env(
++        const char * name, uint64_t min_value, uint64_t max_value, bool & is_set, uint64_t & value) {
++    const char * env = getenv(name);
++    is_set = env != nullptr;
++    value  = 0;
++    if (!is_set) {
++        return true;
++    }
++
++    bool digits_only = env[0] != '\0';
++    for (const char * p = env; *p != '\0'; ++p) {
++        digits_only = digits_only && *p >= '0' && *p <= '9';
++    }
++
++    errno = 0;
++    char * end = nullptr;
++    const unsigned long long parsed = strtoull(env, &end, 10);
++    if (!digits_only || errno == ERANGE || end == env || *end != '\0' ||
++        parsed < min_value || parsed > max_value) {
++        fprintf(stderr,
++                "llama-bench: error: %s must be an integer from %" PRIu64 " through %" PRIu64 "\n",
++                name, min_value, max_value);
++        return false;
++    }
++
++    value = parsed;
++    return true;
++}
++
+ static bool tensor_buft_override_equal(const llama_model_tensor_buft_override& a, const llama_model_tensor_buft_override& b) {
+     if (a.pattern != b.pattern) {
+         // cString comparison that may be null
+@@ -2090,7 +2121,8 @@ struct ctx_state {
+     std::vector<uint8_t> buf; // the llama_context state buffer
+ };
+ 
+-static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_threads) {
++static bool test_prompt(
++        llama_context * ctx, int n_prompt, int n_batch, int n_threads, uint64_t inter_batch_pause_ms = 0) {
+     llama_set_n_threads(ctx, n_threads, n_threads);
+ 
+     const llama_model * model   = llama_get_model(ctx);
+@@ -2113,6 +2145,11 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
+             return false;
+         }
+         n_processed += n_tokens;
++
++        if (inter_batch_pause_ms > 0 && n_processed < n_prompt) {
++            llama_synchronize(ctx);
++            std::this_thread::sleep_for(std::chrono::milliseconds(inter_batch_pause_ms));
++        }
+     }
+ 
+     llama_synchronize(ctx);
+@@ -2189,6 +2226,38 @@ int llama_bench(int argc, char ** argv) {
+ 
+     cmd_params params = parse_cmd_params(argc, argv);
+ 
++    constexpr uint64_t max_depth_cooldown_ms = 10ULL * 60ULL * 1000ULL;
++    constexpr uint64_t max_depth_prefill_pause_ms = 60ULL * 1000ULL;
++
++    bool depth_cooldown_set = false;
++    uint64_t depth_cooldown_ms = 0;
++    if (!parse_bounded_u64_env("LLAMA_BENCH_DEPTH_COOLDOWN_MS", 0, max_depth_cooldown_ms,
++                               depth_cooldown_set, depth_cooldown_ms)) {
++        return 1;
++    }
++
++    bool depth_prefill_chunk_set = false;
++    uint64_t depth_prefill_chunk = 0;
++    if (!parse_bounded_u64_env("LLAMA_BENCH_DEPTH_PREFILL_CHUNK", 1,
++                               std::numeric_limits<int>::max(),
++                               depth_prefill_chunk_set, depth_prefill_chunk)) {
++        return 1;
++    }
++
++    bool depth_prefill_pause_set = false;
++    uint64_t depth_prefill_pause_ms = 0;
++    if (!parse_bounded_u64_env("LLAMA_BENCH_DEPTH_PREFILL_PAUSE_MS", 1, max_depth_prefill_pause_ms,
++                               depth_prefill_pause_set, depth_prefill_pause_ms)) {
++        return 1;
++    }
++    if (depth_prefill_chunk_set != depth_prefill_pause_set) {
++        fprintf(stderr,
++                "%s: error: LLAMA_BENCH_DEPTH_PREFILL_CHUNK and "
++                "LLAMA_BENCH_DEPTH_PREFILL_PAUSE_MS must either both be set or both be unset\n",
++                __func__);
++        return 1;
++    }
++
+     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+     if (!cpu_dev) {
+         fprintf(stderr, "%s: error: CPU backend is not loaded\n", __func__);
+@@ -2210,7 +2279,48 @@ int llama_bench(int argc, char ** argv) {
+         return 1;
+     }
+ 
+-    // initialize printer
++    std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
++    const bool has_positive_depth = std::any_of(
++        params_instances.begin(), params_instances.end(),
++        [](const cmd_params_instance & inst) { return inst.n_depth > 0; });
++
++    if (depth_cooldown_set && depth_cooldown_ms > 0 && !has_positive_depth) {
++        fprintf(stderr,
++                "%s: error: LLAMA_BENCH_DEPTH_COOLDOWN_MS was set, but no positive-depth benchmark exists\n",
++                __func__);
++        return 1;
++    }
++
++    if (depth_prefill_chunk_set) {
++        for (const auto & inst : params_instances) {
++            if (inst.n_depth <= 0) {
++                continue;
++            }
++            const int requested_ubatch = inst.n_ubatch == 0 ? inst.n_batch : inst.n_ubatch;
++            const int configured_ubatch = std::min(inst.n_batch, requested_ubatch);
++            if (inst.n_batch <= 0 || requested_ubatch <= 0 ||
++                depth_prefill_chunk > static_cast<uint64_t>(inst.n_batch) ||
++                depth_prefill_chunk < static_cast<uint64_t>(configured_ubatch) ||
++                depth_prefill_chunk % static_cast<uint64_t>(configured_ubatch) != 0 ||
++                depth_prefill_chunk >= static_cast<uint64_t>(inst.n_depth)) {
++                fprintf(stderr,
++                        "%s: error: LLAMA_BENCH_DEPTH_PREFILL_CHUNK=%" PRIu64
++                        " must be no greater than n_batch=%d, no less than effective n_ubatch=%d, "
++                        "divisible by effective n_ubatch, and less than n_depth=%d for every depth benchmark\n",
++                        __func__, depth_prefill_chunk, inst.n_batch, configured_ubatch, inst.n_depth);
++                return 1;
++            }
++        }
++        if (!has_positive_depth) {
++            fprintf(stderr,
++                    "%s: error: depth prefill pacing was requested, but no positive-depth benchmark exists\n",
++                    __func__);
++            return 1;
++        }
++    }
++
++    // initialize printer only after pacing validation so an invalid request
++    // cannot leave a partial JSON document on stdout or stderr.
+     std::unique_ptr<printer> p     = create_printer(params.output_format);
+     std::unique_ptr<printer> p_err = create_printer(params.output_format_stderr);
+ 
+@@ -2224,8 +2334,6 @@ int llama_bench(int argc, char ** argv) {
+         p_err->print_header(params);
+     }
+ 
+-    std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
+-
+     llama_model *               lmodel    = nullptr;
+     const cmd_params_instance * prev_inst = nullptr;
+ 
+@@ -2299,6 +2407,21 @@ int llama_bench(int argc, char ** argv) {
+ 
+         test t(inst, lmodel, ctx);
+ 
++        const uint32_t actual_n_batch  = llama_n_batch(ctx);
++        const uint32_t actual_n_ubatch = llama_n_ubatch(ctx);
++        if (depth_prefill_chunk_set && t.n_depth > 0 &&
++            (actual_n_ubatch == 0 || depth_prefill_chunk > actual_n_batch ||
++             depth_prefill_chunk < actual_n_ubatch ||
++             depth_prefill_chunk % actual_n_ubatch != 0)) {
++            fprintf(stderr,
++                    "%s: error: LLAMA_BENCH_DEPTH_PREFILL_CHUNK=%" PRIu64
++                    " is incompatible with the normalized context n_batch=%u n_ubatch=%u\n",
++                    __func__, depth_prefill_chunk, actual_n_batch, actual_n_ubatch);
++            llama_free(ctx);
++            llama_model_free(lmodel);
++            return 1;
++        }
++
+         llama_memory_clear(llama_get_memory(ctx), false);
+ 
+         // cool off before the test
+@@ -2358,6 +2481,7 @@ int llama_bench(int argc, char ** argv) {
+ 
+         for (int i = 0; i < params.reps; i++) {
+             llama_memory_clear(llama_get_memory(ctx), false);
++            bool cold_depth_prefill = false;
+ 
+             if (t.n_depth > 0) {
+                 bool is_cached = t.n_depth == cstate.depth;
+@@ -2376,13 +2500,26 @@ int llama_bench(int argc, char ** argv) {
+                         fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d\n", params_idx, params_count,
+                                 i + 1, params.reps);
+                     }
+-                    bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);
++                    const int depth_prefill_batch = depth_prefill_chunk_set ?
++                            static_cast<int>(depth_prefill_chunk) : t.n_batch;
++                    if (depth_prefill_chunk_set) {
++                        fprintf(stderr,
++                                "llama-bench: depth prefill pacing chunk=%d pause_ms=%" PRIu64
++                                " (n_batch=%d n_ubatch=%d actual_n_batch=%u actual_n_ubatch=%u; "
++                                "untimed; benchmark %d/%zu)\n",
++                                depth_prefill_batch, depth_prefill_pause_ms, t.n_batch, t.n_ubatch,
++                                actual_n_batch, actual_n_ubatch, params_idx, params_count);
++                        fflush(stderr);
++                    }
++                    bool res = test_prompt(ctx, t.n_depth, depth_prefill_batch, t.n_threads,
++                                           depth_prefill_pause_ms);
+                     if (!res) {
+                         fprintf(stderr, "%s: error: failed to run depth\n", __func__);
+                         llama_free(ctx);
+                         llama_model_free(lmodel);
+                         exit(1);
+                     }
++                    cold_depth_prefill = true;
+ 
+                     // store the context state for reuse in later runs
+                     cstate.depth = t.n_depth;
+@@ -2396,6 +2533,15 @@ int llama_bench(int argc, char ** argv) {
+                 }
+             }
+ 
++            if ((i == 0 || cold_depth_prefill) && t.n_depth > 0 && depth_cooldown_ms > 0) {
++                fprintf(stderr,
++                        "llama-bench: depth cooldown %" PRIu64 " ms after depth-state setup and before timed work "
++                        "(benchmark %d/%zu)\n",
++                        depth_cooldown_ms, params_idx, params_count);
++                fflush(stderr);
++                std::this_thread::sleep_for(std::chrono::milliseconds(depth_cooldown_ms));
++            }
++
+             uint64_t t_start = get_time_ns();
+ 
+             if (t.n_prompt > 0) {

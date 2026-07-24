@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: austxu <austxu@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 15:05:21 -0700
+Subject: [PATCH 9/9] vulkan: fix attention reducer dispatch geometry
+
+Correct the production attention-sidecar reducer dispatch without retaining temporary diagnostic history.
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 03148f35486c300ad3ef6b511933a1d35eaeb095..98033bbece55a52a9f64a312d61fe4f1c341b449 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -11381,7 +11381,7 @@ static void ggml_vk_flash_attn(
+             const vk_subbuffer q8_buf = { ctx->prealloc_y, 0, q8_size };
+             ggml_vk_dispatch_pipeline(ctx, subctx, reduce_pipeline,
+                                       { split_k_buf, sinks_buf, dst_buf, q8_buf },
+-                                      pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
++                                      pc2, { (uint32_t)ne1, 1, (uint32_t)(ne2 * ne3) });
+ 
+             vk_pipeline to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
+             GGML_ASSERT(to_q8_1 != nullptr);

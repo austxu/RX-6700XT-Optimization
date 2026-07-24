@@ -1,0 +1,38 @@
+{
+  "backend": "Vulkan (RADV), single GPU",
+  "command": [
+    "llama-bench",
+    "-m",
+    "llama-2-7b.Q4_0.gguf",
+    "-ngl",
+    "100",
+    "-fa",
+    "0,1"
+  ],
+  "gpu": "AMD Radeon RX 6700 XT",
+  "model_quantization": "Q4_0",
+  "policy_url": "https://github.com/ggml-org/llama.cpp/discussions/10879#discussioncomment-17557303",
+  "retrieved_utc": "2026-07-24T06:16:53Z",
+  "rows": {
+    "fa-off-pp512": {
+      "tps": 1051.2,
+      "uncertainty_tps": 0.98
+    },
+    "fa-off-tg128": {
+      "tps": 83.88,
+      "uncertainty_tps": 0.08
+    },
+    "fa-on-pp512": {
+      "tps": 1010.9,
+      "uncertainty_tps": 12.89
+    },
+    "fa-on-tg128": {
+      "tps": 81.86,
+      "uncertainty_tps": 0.19
+    }
+  },
+  "schema": "llama2-q4_0-scoreboard-snapshot-v2",
+  "source_commit": "6d75883",
+  "source_url": "https://github.com/ggml-org/llama.cpp/discussions/10879",
+  "workload": "Llama 2 7B Q4_0"
+}

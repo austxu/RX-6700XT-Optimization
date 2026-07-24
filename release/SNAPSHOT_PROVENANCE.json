@@ -1,0 +1,7 @@
+{
+  "history_policy": "Single clean publication root commit; private development history is intentionally excluded.",
+  "schema": "amd-inference-clean-snapshot-v1",
+  "source_commit": "e13928a834d2f2522ea5b5d33343b56022ad4ae5",
+  "source_date_epoch": 1784935774,
+  "source_tree": "6ceca8fabf759a15dce2326d240f9f10022411dd"
+}

@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: austxu <austxu@users.noreply.github.com>
+Date: Thu, 16 Jul 2026 21:56:11 -0700
+Subject: [PATCH 07/10] vulkan: defer Navi22 diagnostics to decode
+
+Keep one-shot route counters available until the first direct fused decode graph so mixed pp/tg benchmark processes report complete model coverage.
+
+Assisted-by: Codex <noreply@openai.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index a8c73b6d912d18ed0aa2aba1faaea3677be0f428..c5f03f76d33079b851f5b03d8ada90c741d8cf30 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -17598,6 +17598,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+ 
+     if (ctx->device->rms_norm_mul_q8_1_navi22 &&
+         ctx->rms_norm_mul_q8_1_dispatches != 0 &&
++        ctx->rms_norm_mul_q8_1_direct_dispatches != 0 &&
+         !ctx->device->rms_norm_mul_q8_1_navi22_diagnostic_logged.exchange(true)) {
+         fprintf(
+             stderr,
+@@ -17630,6 +17631,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+ 
+     if (ctx->device->q4_0_mmvq_navi22 &&
+         ctx->q4_0_mmvq_navi22_dispatches != 0 &&
++        (!ctx->device->rms_norm_mul_q8_1_navi22 ||
++         ctx->rms_norm_mul_q8_1_direct_dispatches != 0) &&
+         !ctx->device->q4_0_mmvq_navi22_diagnostic_logged.exchange(true)) {
+         fprintf(
+             stderr,
+@@ -17640,6 +17643,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+ 
+     if (ctx->device->q4_0_multiproj_navi22 &&
+         ctx->q4_0_multiproj_groups != 0 &&
++        (!ctx->device->rms_norm_mul_q8_1_navi22 ||
++         ctx->rms_norm_mul_q8_1_direct_dispatches != 0) &&
+         !ctx->device->q4_0_multiproj_navi22_diagnostic_logged.exchange(true)) {
+         fprintf(
+             stderr,

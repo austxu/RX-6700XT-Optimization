@@ -1,0 +1,691 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: austxu <austxu@users.noreply.github.com>
+Date: Fri, 17 Jul 2026 14:58:17 -0700
+Subject: [PATCH 8/9] vulkan: fuse Llama 2 attention output on Navi22
+
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 263 +++++++++++++++++-
+ ...sh_attn_split_k_reduce_q8_1_x4_navi22.comp |  93 +++++++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |   1 +
+ tests/test-backend-ops.cpp                    |  79 ++++++
+ 4 files changed, 428 insertions(+), 8 deletions(-)
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_split_k_reduce_q8_1_x4_navi22.comp
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index d91e22db36cad7df4775780323c07df9594b22e2..03148f35486c300ad3ef6b511933a1d35eaeb095 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -755,6 +755,8 @@ struct vk_device_struct {
+     std::atomic<bool> q4_0_multiproj_navi22_diagnostic_logged {};
+     bool rms_norm_mul_q8_1_navi22 {};
+     std::atomic<bool> rms_norm_mul_q8_1_navi22_diagnostic_logged {};
++    bool flash_attn_q8_1_navi22 {};
++    std::atomic<bool> flash_attn_q8_1_navi22_diagnostic_logged {};
+ 
+     bool subgroup_size_control;
+     uint32_t subgroup_min_size;
+@@ -1006,6 +1008,7 @@ struct vk_device_struct {
+     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
+ 
+     vk_pipeline pipeline_flash_attn_split_k_reduce;
++    vk_pipeline pipeline_flash_attn_split_k_reduce_q8_1_x4_navi22;
+     vk_pipeline pipeline_count_experts;
+ 
+     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
+@@ -2175,6 +2178,7 @@ struct ggml_backend_vk_context {
+     // The fused producer does not issue the standalone quantizer's trailing
+     // barrier, so keep its Q8_1 write pending until a consumer or overwrite.
+     bool prealloc_y_fused_q8_write_pending {};
++    const ggml_tensor * prealloc_y_flash_attn_q8_1_tensor {};
+ 
+     // Track which nodes have been used since the last sync, and whether they were written to
+     std::vector<const ggml_tensor *> unsynced_nodes_written;
+@@ -2223,6 +2227,16 @@ struct ggml_backend_vk_context {
+     uint32_t rms_norm_mul_q8_1_q4_k_dispatches {};
+     uint32_t rms_norm_mul_q8_1_partial_dispatches {};
+     uint32_t rms_norm_mul_q8_1_direct_dispatches {};
++    uint32_t flash_attn_q8_1_structural {};
++    uint32_t flash_attn_q8_1_reshape {};
++    uint32_t flash_attn_q8_1_next_matmul {};
++    uint32_t flash_attn_q8_1_activation_match {};
++    uint32_t flash_attn_q8_1_single_consumer {};
++    uint32_t flash_attn_q8_1_exact_shape {};
++    uint32_t flash_attn_q8_1_route {};
++    uint32_t flash_attn_q8_1_split2 {};
++    uint32_t flash_attn_q8_1_produced {};
++    uint32_t flash_attn_q8_1_consumer_cache_hits {};
+     uint32_t q4_0_mmvq_navi22_dispatches {};
+     uint32_t q4_0_multiproj_count {};
+     uint32_t q4_0_multiproj_groups {};
+@@ -5234,6 +5248,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_matmul_split_k_reduce, "split_k_reduce", split_k_reduce_len, split_k_reduce_data, "main", 2, 2 * sizeof(uint32_t), {256 * 4, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce, "fa_split_k_reduce", fa_split_k_reduce_len, fa_split_k_reduce_data, "main", 3, sizeof(vk_op_flash_attn_split_k_reduce_push_constants), {1, device->subgroup_size, 1}, {device->subgroup_size}, 1, true);
++    if (device->flash_attn_q8_1_navi22) {
++        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_split_k_reduce_q8_1_x4_navi22,
++                                "fa_split_k_reduce_q8_1_x4_navi22",
++                                fa_split_k_reduce_q8_1_x4_navi22_len,
++                                fa_split_k_reduce_q8_1_x4_navi22_data,
++                                "main", 4, sizeof(vk_op_flash_attn_split_k_reduce_push_constants),
++                                {1, 128, 1}, {}, 1, true, true, 32);
++    }
+ 
+     for (auto &it : device->pipeline_fa_mask_opt) {
+         auto BrBc = it.first;
+@@ -6871,6 +6893,49 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             throw std::runtime_error("GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22_MODE requires GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22=1");
+         }
+ 
++        const char * flash_attn_q8_1_navi22_env = getenv("GGML_VK_FLASH_ATTN_Q8_1_NAVI22");
++        if (flash_attn_q8_1_navi22_env != nullptr) {
++            const char * rejection_reason = nullptr;
++            if (strcmp(flash_attn_q8_1_navi22_env, "1") != 0) {
++                rejection_reason = "the environment value must be exactly 1";
++            } else if (getenv("GGML_VK_DISABLE_FUSION") != nullptr) {
++                rejection_reason = "GGML_VK_DISABLE_FUSION must be unset";
++            } else if (getenv("GGML_VK_FORCE_MMVQ") != nullptr ||
++                       getenv("GGML_VK_DISABLE_MMVQ") != nullptr) {
++                rejection_reason = "GGML_VK_FORCE_MMVQ and GGML_VK_DISABLE_MMVQ must be unset";
++            } else if (device->vendor_id != VK_VENDOR_ID_AMD ||
++                       device->properties.deviceID != navi22_rx_6700_xt_device_id) {
++                rejection_reason = "the selected device is not an AMD Radeon RX 6700 XT (device ID 0x73df)";
++            } else if (device->architecture != vk_device_architecture::AMD_RDNA2) {
++                rejection_reason = "the selected device was not detected as RDNA2";
++            } else if (device->driver_id != vk::DriverId::eMesaRadv) {
++                rejection_reason = "the selected Vulkan driver is not Mesa RADV";
++            } else if (!device->integer_dot_product) {
++                rejection_reason = "accelerated signed packed 4x8-bit integer dot product is unavailable";
++            } else if (!device->subgroup_basic || !device->subgroup_arithmetic || !device->subgroup_clustered) {
++                rejection_reason = "compute-stage subgroup basic, arithmetic, and clustered operations are required";
++            } else if (!device->subgroup_size_control ||
++                       device->subgroup_min_size > 32 ||
++                       device->subgroup_max_size < 32) {
++                rejection_reason = "a required subgroup size of 32 is unavailable";
++            } else if (!device->subgroup_require_full_support) {
++                rejection_reason = "full compute subgroups are unavailable";
++            } else if (device->properties.limits.maxComputeWorkGroupInvocations < 32 ||
++                       device->properties.limits.maxComputeWorkGroupSize[0] < 32) {
++                rejection_reason = "a 32-invocation compute workgroup is unavailable";
++#if !defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
++            } else {
++                rejection_reason = "this build does not contain integer-dot-product Vulkan shaders";
++#endif
++            }
++
++            if (rejection_reason != nullptr) {
++                GGML_LOG_ERROR("ggml_vulkan: GGML_VK_FLASH_ATTN_Q8_1_NAVI22 rejected: %s\n", rejection_reason);
++                throw std::runtime_error(std::string("GGML_VK_FLASH_ATTN_Q8_1_NAVI22 rejected: ") + rejection_reason);
++            }
++            device->flash_attn_q8_1_navi22 = true;
++        }
++
+         // Shaders
+         // Disable matmul tile sizes early if performance low or not supported
+         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
+@@ -9288,6 +9353,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+             ctx->prealloc_y_last_pipeline_used = to_fp16_vk_1.get();
+             ctx->prealloc_y_last_tensor_used = src1;
+             ctx->prealloc_y_last_decode_vector_staging = false;
++            ctx->prealloc_y_flash_attn_q8_1_tensor = nullptr;
+         }
+     }
+     if (quantize_y) {
+@@ -9301,6 +9367,7 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
+             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
+             ctx->prealloc_y_last_tensor_used = src1;
+             ctx->prealloc_y_last_decode_vector_staging = false;
++            ctx->prealloc_y_flash_attn_q8_1_tensor = nullptr;
+         }
+     }
+ 
+@@ -9567,6 +9634,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+             ctx->prealloc_y_last_pipeline_used = to_fp16_vk_1.get();
+             ctx->prealloc_y_last_tensor_used = src1;
+             ctx->prealloc_y_last_decode_vector_staging = false;
++            ctx->prealloc_y_flash_attn_q8_1_tensor = nullptr;
+         }
+     }
+     if (quantize_y) {
+@@ -9574,6 +9642,9 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+             ctx->prealloc_y_last_pipeline_used == to_q8_1.get() &&
+             ctx->prealloc_y_last_tensor_used == src1 &&
+             !ctx->prealloc_y_last_decode_vector_staging;
++        if (q8_cache_hit && ctx->prealloc_y_flash_attn_q8_1_tensor == src1) {
++            ++ctx->flash_attn_q8_1_consumer_cache_hits;
++        }
+         if (q8_cache_hit && ctx->prealloc_y_fused_q8_write_pending) {
+             // The fused producer does not contain the standalone quantizer's
+             // trailing barrier. Make its compute write visible before MMVQ
+@@ -9587,6 +9658,7 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
+             ctx->prealloc_y_last_tensor_used = src1;
+             ctx->prealloc_y_last_decode_vector_staging = false;
++            ctx->prealloc_y_flash_attn_q8_1_tensor = nullptr;
+         }
+     }
+ 
+@@ -10508,6 +10580,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+             ctx->prealloc_y_last_pipeline_used = to_fp16_vk_1.get();
+             ctx->prealloc_y_last_tensor_used = src1;
+             ctx->prealloc_y_last_decode_vector_staging = y_decode_vector_staging;
++            ctx->prealloc_y_flash_attn_q8_1_tensor = nullptr;
+         }
+     }
+     if (quantize_y) {
+@@ -10521,6 +10594,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context&
+             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
+             ctx->prealloc_y_last_tensor_used = src1;
+             ctx->prealloc_y_last_decode_vector_staging = false;
++            ctx->prealloc_y_flash_attn_q8_1_tensor = nullptr;
+         }
+     }
+     ggml_vk_sync_buffers(ctx, subctx);
+@@ -10709,6 +10783,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
+             ctx->prealloc_y_last_pipeline_used = to_fp16_vk_1.get();
+             ctx->prealloc_y_last_tensor_used = src1;
+             ctx->prealloc_y_last_decode_vector_staging = false;
++            ctx->prealloc_y_flash_attn_q8_1_tensor = nullptr;
+         }
+     }
+     if (quantize_y) {
+@@ -10722,6 +10797,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
+             ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
+             ctx->prealloc_y_last_tensor_used = src1;
+             ctx->prealloc_y_last_decode_vector_staging = false;
++            ctx->prealloc_y_flash_attn_q8_1_tensor = nullptr;
+         }
+     }
+ 
+@@ -10907,7 +10983,96 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
+     return supported;
+ }
+ 
+-static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
++static const ggml_tensor * ggml_vk_flash_attn_q8_1_navi22_eligible(
++        ggml_backend_vk_context * ctx,
++        const ggml_cgraph * cgraph,
++        int node_idx,
++        const ggml_tensor * q,
++        const ggml_tensor * k,
++        const ggml_tensor * v,
++        const ggml_tensor * mask,
++        const ggml_tensor * sinks,
++        const ggml_tensor * dst) {
++    if (!ctx->device->flash_attn_q8_1_navi22 ||
++        q == nullptr || k == nullptr || v == nullptr || mask == nullptr || sinks != nullptr ||
++        q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16 ||
++        mask->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32 ||
++        q->ne[0] != 128 || q->ne[1] != 1 || q->ne[2] != 32 || q->ne[3] != 1 ||
++        k->ne[0] != 128 || k->ne[2] != 32 || k->ne[3] != 1 ||
++        v->ne[0] != 128 || v->ne[1] != k->ne[1] || v->ne[2] != 32 || v->ne[3] != 1 ||
++        mask->ne[0] != k->ne[1] || mask->ne[1] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 ||
++        dst->ne[0] != 128 || dst->ne[1] != 32 || dst->ne[2] != 1 || dst->ne[3] != 1 ||
++        dst->op_params[3] != GGML_PREC_F32 || !ggml_is_contiguous(dst)) {
++        return nullptr;
++    }
++    ++ctx->flash_attn_q8_1_structural;
++
++    if (node_idx + 2 >= cgraph->n_nodes) {
++        return nullptr;
++    }
++    const ggml_tensor * activation = cgraph->nodes[node_idx + 1];
++    if (activation->op != GGML_OP_RESHAPE || activation->src[0] != dst ||
++        activation->type != GGML_TYPE_F32 || activation->ne[0] != 4096 ||
++        activation->ne[1] != 1 || activation->ne[2] != 1 || activation->ne[3] != 1 ||
++        !ggml_is_contiguous(activation)) {
++        return nullptr;
++    }
++    ++ctx->flash_attn_q8_1_reshape;
++
++    const ggml_tensor * consumer = cgraph->nodes[node_idx + 2];
++    if (consumer->op != GGML_OP_MUL_MAT) {
++        return nullptr;
++    }
++    ++ctx->flash_attn_q8_1_next_matmul;
++    if (consumer->src[1] != activation) {
++        return nullptr;
++    }
++    ++ctx->flash_attn_q8_1_activation_match;
++
++    uint32_t activation_uses = 0;
++    for (int i = node_idx + 2; i < cgraph->n_nodes; ++i) {
++        for (int j = 0; j < GGML_MAX_SRC; ++j) {
++            activation_uses += cgraph->nodes[i]->src[j] == activation;
++        }
++    }
++    if (activation_uses != 1) {
++        return nullptr;
++    }
++    ++ctx->flash_attn_q8_1_single_consumer;
++
++    const ggml_tensor * weight = consumer->src[0];
++    if (weight == nullptr || weight->type != GGML_TYPE_Q4_0 ||
++        weight->ne[0] != 4096 || weight->ne[1] != 4096 ||
++        weight->ne[2] != 1 || weight->ne[3] != 1 ||
++        consumer->type != GGML_TYPE_F32 || consumer->ne[0] != 4096 ||
++        consumer->ne[1] != 1 || consumer->ne[2] != 1 || consumer->ne[3] != 1 ||
++        !ggml_vk_dim01_contiguous(weight)) {
++        return nullptr;
++    }
++    ++ctx->flash_attn_q8_1_exact_shape;
++
++    const bool route = ctx->device->integer_dot_product &&
++        ggml_vk_should_use_mmvq(ctx->device, 4096, 1, 4096, GGML_TYPE_Q4_0) &&
++        ggml_vk_get_dequantize_mul_mat_vec(
++            ctx, GGML_TYPE_Q4_0, GGML_TYPE_Q8_1, 1, 4096, 4096) != nullptr;
++    if (!route) {
++        return nullptr;
++    }
++    ++ctx->flash_attn_q8_1_route;
++    return activation;
++}
++
++static void ggml_vk_flash_attn(
++        ggml_backend_vk_context * ctx,
++        vk_context& subctx,
++        const ggml_cgraph * cgraph,
++        int node_idx,
++        const ggml_tensor * q,
++        const ggml_tensor * k,
++        const ggml_tensor * v,
++        const ggml_tensor * mask,
++        const ggml_tensor * sinks,
++        ggml_tensor * dst) {
+     VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
+     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
+     std::cerr << "), (" << v << ", name=" << v->name << ", type=" << v->type << ", ne0=" << v->ne[0] << ", ne1=" << v->ne[1] << ", ne2=" << v->ne[2] << ", ne3=" << v->ne[3] << ", nb0=" << v->nb[0] << ", nb1=" << v->nb[1] << ", nb2=" << v->nb[2] << ", nb3=" << v->nb[3];
+@@ -10926,6 +11091,9 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+     GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
+     GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+ 
++    const ggml_tensor * q8_activation = ggml_vk_flash_attn_q8_1_navi22_eligible(
++        ctx, cgraph, node_idx, q, k, v, mask, sinks, dst);
++
+     const uint32_t nem0 = mask ? mask->ne[0] : 0;
+     const uint32_t nem1 = mask ? mask->ne[1] : 0;
+     const uint32_t nem2 = mask ? mask->ne[2] : 0;
+@@ -11072,6 +11240,11 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+         split_k = CEIL_DIV(KV, split_kv);
+     }
+ 
++    const bool fuse_q8 = q8_activation != nullptr && split_k == 2;
++    if (fuse_q8) {
++        ++ctx->flash_attn_q8_1_split2;
++    }
++
+     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)
+     // and the per-row m and L values (ne1 rows). We store all the matrices first, followed by the rows.
+     // For matrices, the order is (inner to outer) [HSV, ne1, k, ne2, ne3].
+@@ -11085,6 +11258,21 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+         ggml_vk_preallocate_buffers(ctx, subctx);
+     }
+ 
++    size_t q8_size = 0;
++    if (fuse_q8) {
++        q8_size = ggml_vk_align_size(ggml_nelements(q8_activation), 128) *
++                  ggml_type_size(GGML_TYPE_Q8_1) /
++                  ggml_blck_size(GGML_TYPE_Q8_1);
++        GGML_ASSERT(ggml_nelements(q8_activation) == 4096 && q8_size <= ctx->device->properties.limits.maxStorageBufferRange);
++        if (ctx->prealloc_size_y < q8_size) {
++            ctx->prealloc_size_y = q8_size;
++            ggml_vk_preallocate_buffers(ctx, subctx);
++        } else if (ctx->prealloc_y == nullptr) {
++            ggml_vk_preallocate_buffers(ctx, subctx);
++        }
++        GGML_ASSERT(ctx->prealloc_y != nullptr && ctx->prealloc_y->size >= q8_size);
++    }
++
+     const uint32_t mask_opt_num_dwords = CEIL_DIV(nem0, 16 * Bc);
+     const uint64_t mask_opt_size = sizeof(uint32_t) * mask_opt_num_dwords * CEIL_DIV(nem1, Br) * nem2 * nem3;
+ 
+@@ -11161,9 +11349,14 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+                                               gqa_ratio, split_kv, split_k };
+ 
+     if (split_k > 1) {
+-        ggml_pipeline_request_descriptor_sets(ctx, ctx->device->pipeline_flash_attn_split_k_reduce, 1);
+-
+-        if (ctx->prealloc_split_k_need_sync) {
++        vk_pipeline reduce_pipeline = fuse_q8 ?
++            ctx->device->pipeline_flash_attn_split_k_reduce_q8_1_x4_navi22 :
++            ctx->device->pipeline_flash_attn_split_k_reduce;
++        GGML_ASSERT(reduce_pipeline != nullptr);
++        ggml_pipeline_request_descriptor_sets(ctx, reduce_pipeline, 1);
++
++        if (ctx->prealloc_split_k_need_sync ||
++            (fuse_q8 && (ctx->prealloc_y_need_sync || ctx->prealloc_y_fused_q8_write_pending))) {
+             ggml_vk_sync_buffers(ctx, subctx);
+         }
+ 
+@@ -11184,9 +11377,26 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
+ 
+         ggml_vk_sync_buffers(ctx, subctx);
+         const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3, split_k, (sinks != nullptr) };
+-        ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
+-                                    {split_k_buf, sinks_buf, dst_buf},
+-                                    pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
++        if (fuse_q8) {
++            const vk_subbuffer q8_buf = { ctx->prealloc_y, 0, q8_size };
++            ggml_vk_dispatch_pipeline(ctx, subctx, reduce_pipeline,
++                                      { split_k_buf, sinks_buf, dst_buf, q8_buf },
++                                      pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
++
++            vk_pipeline to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
++            GGML_ASSERT(to_q8_1 != nullptr);
++            ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
++            ctx->prealloc_y_last_tensor_used = q8_activation;
++            ctx->prealloc_y_last_decode_vector_staging = false;
++            ctx->prealloc_y_fused_q8_write_pending = true;
++            ctx->prealloc_y_flash_attn_q8_1_tensor = q8_activation;
++            ctx->prealloc_y_need_sync = true;
++            ++ctx->flash_attn_q8_1_produced;
++        } else {
++            ggml_vk_dispatch_pipeline(ctx, subctx, reduce_pipeline,
++                                      { split_k_buf, sinks_buf, dst_buf },
++                                      pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });
++        }
+         ctx->prealloc_split_k_need_sync = true;
+     } else {
+         if (gqa_ratio > 1) {
+@@ -13398,6 +13608,7 @@ static void ggml_vk_rms_norm_mul_q8_1_navi22(
+     ctx->prealloc_y_last_tensor_used = dst;
+     ctx->prealloc_y_last_decode_vector_staging = false;
+     ctx->prealloc_y_fused_q8_write_pending = true;
++    ctx->prealloc_y_flash_attn_q8_1_tensor = nullptr;
+     ctx->prealloc_y_need_sync = true;
+     ++ctx->rms_norm_mul_q8_1_dispatches;
+     if (q4_type == GGML_TYPE_Q4_0) {
+@@ -15372,6 +15583,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
+         ctx->prealloc_y_last_tensor_used = nullptr;
+         ctx->prealloc_y_last_decode_vector_staging = false;
+         ctx->prealloc_y_fused_q8_write_pending = false;
++        ctx->prealloc_y_flash_attn_q8_1_tensor = nullptr;
+     }
+     if (ctx->prealloc_split_k == nullptr || (ctx->prealloc_size_split_k > 0 && ctx->prealloc_split_k->size < ctx->prealloc_size_split_k)) {
+         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(split_k_size: " << ctx->prealloc_size_split_k << ")");
+@@ -15847,7 +16059,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+         break;
+ 
+     case GGML_OP_FLASH_ATTN_EXT:
+-        ggml_vk_flash_attn(ctx, compute_ctx, src0, src1, src2, src3, node->src[4], node);
++        ggml_vk_flash_attn(ctx, compute_ctx, cgraph, node_idx, src0, src1, src2, src3, node->src[4], node);
+ 
+         break;
+ 
+@@ -15970,6 +16182,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
+     ctx->prealloc_y_last_tensor_used = nullptr;
+     ctx->prealloc_y_last_decode_vector_staging = false;
+     ctx->prealloc_y_fused_q8_write_pending = false;
++    ctx->prealloc_y_flash_attn_q8_1_tensor = nullptr;
+ 
+     ctx->unsynced_nodes_written.clear();
+     ctx->unsynced_nodes_read.clear();
+@@ -16023,6 +16236,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
+     ctx->prealloc_y_last_tensor_used = nullptr;
+     ctx->prealloc_y_last_decode_vector_staging = false;
+     ctx->prealloc_y_fused_q8_write_pending = false;
++    ctx->prealloc_y_flash_attn_q8_1_tensor = nullptr;
+ 
+     ctx->prealloc_size_x = 0;
+     ctx->prealloc_size_y = 0;
+@@ -17180,6 +17394,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     ctx->prealloc_y_last_tensor_used = nullptr;
+     ctx->prealloc_y_last_decode_vector_staging = false;
+     ctx->prealloc_y_fused_q8_write_pending = false;
++    ctx->prealloc_y_flash_attn_q8_1_tensor = nullptr;
+ 
+     if (ctx->prealloc_size_add_rms_partials) {
+         ggml_vk_preallocate_buffers(ctx, nullptr);
+@@ -17214,6 +17429,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     ctx->rms_norm_mul_q8_1_q4_k_dispatches = 0;
+     ctx->rms_norm_mul_q8_1_partial_dispatches = 0;
+     ctx->rms_norm_mul_q8_1_direct_dispatches = 0;
++    ctx->flash_attn_q8_1_structural = 0;
++    ctx->flash_attn_q8_1_reshape = 0;
++    ctx->flash_attn_q8_1_next_matmul = 0;
++    ctx->flash_attn_q8_1_activation_match = 0;
++    ctx->flash_attn_q8_1_single_consumer = 0;
++    ctx->flash_attn_q8_1_exact_shape = 0;
++    ctx->flash_attn_q8_1_route = 0;
++    ctx->flash_attn_q8_1_split2 = 0;
++    ctx->flash_attn_q8_1_produced = 0;
++    ctx->flash_attn_q8_1_consumer_cache_hits = 0;
+     ctx->q4_0_mmvq_navi22_dispatches = 0;
+     ctx->q4_0_multiproj_count = 0;
+     ctx->q4_0_multiproj_groups = 0;
+@@ -17573,6 +17798,28 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+             ctx->q4_0_multiproj_logical_dispatches);
+     }
+ 
++    if (ctx->device->flash_attn_q8_1_navi22 &&
++        ctx->flash_attn_q8_1_produced != 0 &&
++        !ctx->device->flash_attn_q8_1_navi22_diagnostic_logged.exchange(true)) {
++        fprintf(
++            stderr,
++            "ggml_vulkan: fused split-k FLASH_ATTN_EXT -> Q8_1_x4 Navi22 ACTIVE "
++            "(expected_model_produced=32 structural=%u reshape=%u next_matmul=%u "
++            "activation_match=%u single_consumer=%u exact_q4_0_shape=%u route=%u split2=%u "
++            "produced=%u consumer_cache_hits=%u local_size=32 outputs_per_lane=4 "
++            "reducer_workgroups_per_head=1 wave32)\n",
++            ctx->flash_attn_q8_1_structural,
++            ctx->flash_attn_q8_1_reshape,
++            ctx->flash_attn_q8_1_next_matmul,
++            ctx->flash_attn_q8_1_activation_match,
++            ctx->flash_attn_q8_1_single_consumer,
++            ctx->flash_attn_q8_1_exact_shape,
++            ctx->flash_attn_q8_1_route,
++            ctx->flash_attn_q8_1_split2,
++            ctx->flash_attn_q8_1_produced,
++            ctx->flash_attn_q8_1_consumer_cache_hits);
++    }
++
+     if (vk_perf_logger_enabled) {
+         // End the command buffer and submit/wait
+         GGML_ASSERT(!ctx->compute_ctx.expired());
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_split_k_reduce_q8_1_x4_navi22.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_split_k_reduce_q8_1_x4_navi22.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f7fab18c32b1adb09d28abcf5578249fca539d5e
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_split_k_reduce_q8_1_x4_navi22.comp
+@@ -0,0 +1,93 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : enable
++#extension GL_KHR_shader_subgroup_arithmetic : require
++#extension GL_KHR_shader_subgroup_basic : require
++#extension GL_KHR_shader_subgroup_clustered : require
++
++#include "types.glsl"
++
++layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A {float data_a[];};
++layout (binding = 1) readonly buffer B {float data_s[];};
++layout (binding = 2) writeonly buffer D {float data_d[];};
++layout (binding = 3, std430) writeonly buffer Q8Buf {block_q8_1_x4 data_q8[];};
++
++layout (push_constant) uniform parameter {
++    uint D;
++    uint ne1;
++    uint ne2;
++    uint ne3;
++    uint k_num;
++    uint sinks;
++} p;
++
++shared float stats[3];
++
++void main() {
++    const uint n = gl_WorkGroupID.x;
++    const uint lane = gl_LocalInvocationID.x;
++    const uint i2 = gl_WorkGroupID.z % p.ne2;
++    const uint i3 = gl_WorkGroupID.z / p.ne2;
++
++    const uint lm_base = p.D * p.ne1 * p.ne2 * p.ne3 * p.k_num;
++    const uint lm_head = p.ne1 * 2 * p.k_num * (i2 + p.ne2 * i3);
++    const uint l_offset = lm_base + lm_head + n;
++    const uint m_offset = lm_base + lm_head + p.ne1 + n;
++    const uint lm_stride = p.ne1 * 2;
++
++    if (lane == 0) {
++        const float m0 = data_a[m_offset];
++        const float m1 = data_a[m_offset + lm_stride];
++        const float m_max = max(m0, m1);
++        const float e0 = exp(m0 - m_max);
++        const float e1 = exp(m1 - m_max);
++        const float L = e0 * data_a[l_offset] + e1 * data_a[l_offset + lm_stride];
++
++        stats[0] = e0;
++        stats[1] = e1;
++        stats[2] = L == 0.0 ? 0.0 : 1.0 / L;
++    }
++    barrier();
++
++    const float e0 = stats[0];
++    const float e1 = stats[1];
++    const float inv_L = stats[2];
++    const uint block = lane / 8;
++    const uint iqs = lane % 8;
++    const uint d_base = block * 32 + iqs * 4;
++    const uint output_base = (i3 * p.ne2 + i2) * p.ne1 * p.D + p.D * n;
++    const uint o0_base = p.D * p.ne1 * p.k_num * (i2 + p.ne2 * i3) + p.D * n;
++    const uint o1_base = o0_base + p.D * p.ne1;
++
++    vec4 vals;
++    [[unroll]] for (uint j = 0; j < 4; ++j) {
++        const uint d = d_base + j;
++        float O = 0.0;
++        O += e0 * data_a[o0_base + d];
++        O += e1 * data_a[o1_base + d];
++        O *= inv_L;
++
++        const float FLT_MAX = uintBitsToFloat(0x7F7FFFFF);
++        O = clamp(O, -FLT_MAX, FLT_MAX);
++        data_d[output_base + d] = O;
++        vals[j] = O;
++    }
++
++    const vec4 abs_vals = abs(vals);
++    const float thread_max = max(max(abs_vals.x, abs_vals.y), max(abs_vals.z, abs_vals.w));
++    const float amax = subgroupClusteredMax(thread_max, 8);
++    const float qd = amax / 127.0;
++    const float d_inv = qd != 0.0 ? 1.0 / qd : 0.0;
++    vals = round(vals * d_inv);
++
++    const uint q8_outer = (i3 * p.ne2 + i2) * p.ne1 + n;
++    data_q8[q8_outer].qs[block * 8 + iqs] = pack32(i8vec4(round(vals)));
++
++    const float thread_sum = vals.x + vals.y + vals.z + vals.w;
++    const float qsum = subgroupClusteredAdd(thread_sum, 8);
++    if (iqs == 0) {
++        data_q8[q8_outer].ds[block] = f16vec2(vec2(qd, qsum * qd));
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 23ceeffdcd08b0567e4dc96afee7d4f10223292a..e505bdc2ac48a37ab1c429344816a4a61ac3beef 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -874,6 +874,7 @@ void process_shaders() {
+ 
+     string_to_spv("split_k_reduce", "mul_mat_split_k_reduce.comp", {});
+     string_to_spv("fa_split_k_reduce", "flash_attn_split_k_reduce.comp", {});
++    string_to_spv("fa_split_k_reduce_q8_1_x4_navi22", "flash_attn_split_k_reduce_q8_1_x4_navi22.comp", {});
+ 
+     string_to_spv("fa_mask_opt", "flash_attn_mask_opt.comp", {});
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index ba7cf4b09ddf4d572c71dda12c23a21e47b8eb3c..6a0efadb57512179a135814c0bd494ee8bfe0779 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -7020,6 +7020,80 @@ struct test_flash_attn_ext : public test_case {
+     }
+ };
+ 
++// GGML_OP_FLASH_ATTN_EXT + GGML_OP_RESHAPE + GGML_OP_MUL_MAT
++struct test_flash_attn_q4_0_mul_mat : public test_case {
++    const int64_t kv;
++    const int64_t output_rows;
++    const uint32_t chains;
++    const uint32_t consumers;
++
++    explicit test_flash_attn_q4_0_mul_mat(
++            int64_t kv = 256,
++            int64_t output_rows = 4096,
++            uint32_t chains = 1,
++            uint32_t consumers = 1)
++        : kv(kv), output_rows(output_rows), chains(chains), consumers(consumers) {
++        GGML_ASSERT(kv > 0 && output_rows > 0 && chains > 0 && consumers > 0);
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "FLASH_ATTN_Q4_0_MUL_MAT";
++    }
++
++    std::string vars() override {
++        return VARS_TO_STR4(kv, output_rows, chains, consumers);
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    double max_nmse_err() override {
++        return 5e-4;
++    }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * out = nullptr;
++        for (uint32_t chain = 0; chain < chains; ++chain) {
++            ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, 1, 32, 1);
++            ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 128, kv, 32, 1);
++            ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 128, kv, 32, 1);
++            ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, 1, 1, 1);
++            ggml_format_name(q, "q_%u", chain);
++            ggml_format_name(k, "k_%u", chain);
++            ggml_format_name(v, "v_%u", chain);
++            ggml_format_name(mask, "mask_%u", chain);
++
++            ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f/sqrtf(128.0f), 0.0f, 0.0f);
++            ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
++            ggml_format_name(fa, "fa_%u", chain);
++
++            ggml_tensor * activation = ggml_reshape_2d(ctx, fa, 4096, 1);
++            ggml_format_name(activation, "activation_%u", chain);
++
++            for (uint32_t consumer_idx = 0; consumer_idx < consumers; ++consumer_idx) {
++                ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 4096, output_rows);
++                ggml_format_name(weight, "weight_%u_%u", chain, consumer_idx);
++
++                ggml_tensor * consumer = ggml_mul_mat(ctx, weight, activation);
++                ggml_format_name(consumer, "consumer_%u_%u", chain, consumer_idx);
++                out = out == nullptr ? consumer : ggml_add(ctx, out, consumer);
++            }
++        }
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            if (strncmp(t->name, "mask_", 5) == 0) {
++                init_tensor_kq_mask(t);
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++};
++
+ // GGML_OP_CROSS_ENTROPY_LOSS
+ struct test_cross_entropy_loss : public test_case {
+     const ggml_type type;
+@@ -9666,6 +9740,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_Q4_0));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 128, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q1_0));
+     test_cases.emplace_back(new test_flash_attn_ext(128, 64, 4, {1, 1}, 64, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q1_0, GGML_TYPE_F16));
++    test_cases.emplace_back(new test_flash_attn_q4_0_mul_mat(256, 4096, 1, 1));
++    test_cases.emplace_back(new test_flash_attn_q4_0_mul_mat(32,  4096, 1, 1));
++    test_cases.emplace_back(new test_flash_attn_q4_0_mul_mat(256, 4032, 1, 1));
++    test_cases.emplace_back(new test_flash_attn_q4_0_mul_mat(256, 4096, 1, 2));
++    test_cases.emplace_back(new test_flash_attn_q4_0_mul_mat(256, 4096, 2, 1));
+ 
+     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
+     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));

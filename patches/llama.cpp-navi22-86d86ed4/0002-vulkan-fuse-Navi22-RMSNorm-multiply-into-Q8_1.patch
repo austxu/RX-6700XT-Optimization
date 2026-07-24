@@ -1,0 +1,709 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: austxu <austxu@users.noreply.github.com>
+Date: Thu, 16 Jul 2026 14:56:01 -0700
+Subject: [PATCH 2/9] vulkan: fuse Navi22 RMSNorm multiply into Q8_1
+
+Assisted-by: OpenAI Codex
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 281 +++++++++++++++++-
+ .../rms_norm_mul_partials_q8_1_x4_navi22.comp | 126 ++++++++
+ .../rms_norm_mul_q8_1_x4_navi22.comp          | 135 +++++++++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |   2 +
+ 4 files changed, 540 insertions(+), 4 deletions(-)
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/rms_norm_mul_partials_q8_1_x4_navi22.comp
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/rms_norm_mul_q8_1_x4_navi22.comp
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index b113e13d08ca05c7eb791430ab302b75de0f0593..3e6be2a96be572577bb6fbd2eee69800612d9004 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -747,10 +747,13 @@ struct vk_device_struct {
+     int32_t mmvq_mode;
+     bool q4_k_mmvq_navi22 {};
+     std::atomic<bool> q4_k_mmvq_navi22_banner_logged {};
++    bool rms_norm_mul_q8_1_navi22 {};
++    std::atomic<bool> rms_norm_mul_q8_1_navi22_diagnostic_logged {};
+ 
+     bool subgroup_size_control;
+     uint32_t subgroup_min_size;
+     uint32_t subgroup_max_size;
++    uint32_t subgroup_max_workgroup_subgroups;
+     bool subgroup_require_full_support;
+ 
+     // floor(log2(maxComputeWorkGroupInvocations))
+@@ -881,6 +884,8 @@ struct vk_device_struct {
+     vk_pipeline pipeline_rms_norm_mul_f32;
+     vk_pipeline pipeline_rms_norm_partials_f32;
+     vk_pipeline pipeline_rms_norm_mul_partials_f32;
++    vk_pipeline pipeline_rms_norm_mul_partials_q8_1_x4_navi22;
++    vk_pipeline pipeline_rms_norm_mul_q8_1_x4_navi22;
+     vk_pipeline pipeline_rms_norm_mul_rope_f32_f32;
+     vk_pipeline pipeline_rms_norm_mul_rope_f32_f16;
+     vk_pipeline pipeline_rms_norm_back_f32;
+@@ -2151,6 +2156,9 @@ struct ggml_backend_vk_context {
+     // True when prealloc_y holds the padded fp16 layout used by the coopmat2 B decode-vector callback.
+     // If false, then it's contiguous.
+     bool prealloc_y_last_decode_vector_staging {};
++    // The fused producer does not issue the standalone quantizer's trailing
++    // barrier, so keep its Q8_1 write pending until a consumer or overwrite.
++    bool prealloc_y_fused_q8_write_pending {};
+ 
+     // Track which nodes have been used since the last sync, and whether they were written to
+     std::vector<const ggml_tensor *> unsynced_nodes_written;
+@@ -2183,6 +2191,16 @@ struct ggml_backend_vk_context {
+     // Bit 'i' means nodes[start_of_fusion + i] writes to memory.
+     // If there's no fusion, bit 0 is still set.
+     int fused_ops_write_mask {};
++    uint32_t rms_norm_mul_q8_1_structural {};
++    uint32_t rms_norm_mul_q8_1_partials {};
++    uint32_t rms_norm_mul_q8_1_direct_eligible {};
++    uint32_t rms_norm_mul_q8_1_next_matmul {};
++    uint32_t rms_norm_mul_q8_1_activation_match {};
++    uint32_t rms_norm_mul_q8_1_q4_shape {};
++    uint32_t rms_norm_mul_q8_1_route {};
++    uint32_t rms_norm_mul_q8_1_dispatches {};
++    uint32_t rms_norm_mul_q8_1_partial_dispatches {};
++    uint32_t rms_norm_mul_q8_1_direct_dispatches {};
+     topk_moe_mode fused_topk_moe_mode {};
+     bool fused_topk_moe_scale {};
+ 
+@@ -3361,6 +3379,7 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
+ 
+     if (ctx) {
+         ctx->prealloc_x_need_sync = ctx->prealloc_y_need_sync = ctx->prealloc_split_k_need_sync = false;
++        ctx->prealloc_y_fused_q8_write_pending = false;
+     }
+ 
+     subctx->s->buffer->buf.pipelineBarrier(
+@@ -5198,6 +5217,20 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_f32, "rms_norm_mul_f32", rms_norm_f32_len, rms_norm_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_partials_f32, "rms_norm_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 0}, 1, true);
+     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_partials_f32, "rms_norm_mul_partials_f32", rms_norm_partials_f32_len, rms_norm_partials_f32_data, "main", 4, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {0, 1}, 1, true);
++    if (device->rms_norm_mul_q8_1_navi22) {
++        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_partials_q8_1_x4_navi22,
++                                "rms_norm_mul_partials_q8_1_x4_navi22",
++                                rms_norm_mul_partials_q8_1_x4_navi22_len,
++                                rms_norm_mul_partials_q8_1_x4_navi22_data,
++                                "main", 5, sizeof(vk_op_binary_push_constants),
++                                {1, 1, 1}, {0, 1}, 1, true, true, 32);
++        ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_q8_1_x4_navi22,
++                                "rms_norm_mul_q8_1_x4_navi22",
++                                rms_norm_mul_q8_1_x4_navi22_len,
++                                rms_norm_mul_q8_1_x4_navi22_data,
++                                "main", 4, sizeof(vk_op_binary_push_constants),
++                                {1, 1, 1}, {0, 1}, 1, true, true, 32);
++    }
+ 
+     if (sizeof(vk_op_rms_norm_mul_rope_push_constants) <= device->properties.limits.maxPushConstantsSize) {
+         ggml_vk_create_pipeline(device, device->pipeline_rms_norm_mul_rope_f32_f32, "rms_norm_mul_rope_f32_f32", rms_norm_mul_rope_f32_f32_len, rms_norm_mul_rope_f32_f32_data, "main", 7, sizeof(vk_op_rms_norm_mul_rope_push_constants), {1, 1, 1}, {0, 1}, 1, true);
+@@ -6349,6 +6382,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
+         if (device->subgroup_size_control) {
+             device->subgroup_min_size = subgroup_size_control_props.minSubgroupSize;
+             device->subgroup_max_size = subgroup_size_control_props.maxSubgroupSize;
++            device->subgroup_max_workgroup_subgroups = subgroup_size_control_props.maxComputeWorkgroupSubgroups;
+             device_extensions.push_back("VK_EXT_subgroup_size_control");
+         }
+ 
+@@ -6651,6 +6685,59 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             device->q4_k_mmvq_navi22 = true;
+         }
+ 
++        const char * rms_norm_mul_q8_1_navi22_env = getenv("GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22");
++        const char * rms_norm_mul_q8_1_navi22_mode_env = getenv("GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22_MODE");
++        if (rms_norm_mul_q8_1_navi22_env != nullptr) {
++            const char * rejection_reason = nullptr;
++            if (strcmp(rms_norm_mul_q8_1_navi22_env, "1") != 0) {
++                rejection_reason = "the environment value must be exactly 1";
++            } else if (rms_norm_mul_q8_1_navi22_mode_env == nullptr ||
++                       strcmp(rms_norm_mul_q8_1_navi22_mode_env, "direct") != 0) {
++                rejection_reason = "GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22_MODE must be exactly direct";
++            } else if (!device->q4_k_mmvq_navi22) {
++                rejection_reason = "the GGML_VK_Q4_K_MMVQ_NAVI22 route must be enabled";
++            } else if (getenv("GGML_VK_DISABLE_FUSION") != nullptr) {
++                rejection_reason = "GGML_VK_DISABLE_FUSION must be unset";
++            } else if (device->vendor_id != VK_VENDOR_ID_AMD ||
++                       device->properties.deviceID != navi22_rx_6700_xt_device_id) {
++                rejection_reason = "the selected device is not an AMD Radeon RX 6700 XT (device ID 0x73df)";
++            } else if (device->architecture != vk_device_architecture::AMD_RDNA2) {
++                rejection_reason = "the selected device was not detected as RDNA2";
++            } else if (device->driver_id != vk::DriverId::eMesaRadv) {
++                rejection_reason = "the selected Vulkan driver is not Mesa RADV";
++            } else if (!device->integer_dot_product) {
++                rejection_reason = "accelerated signed packed 4x8-bit integer dot product is unavailable";
++            } else if (!device->subgroup_basic || !device->subgroup_arithmetic || !device->subgroup_clustered) {
++                rejection_reason = "compute-stage subgroup basic, arithmetic, and clustered operations are required";
++            } else if (!device->subgroup_size_control ||
++                       device->subgroup_min_size > 32 ||
++                       device->subgroup_max_size < 32) {
++                rejection_reason = "a required subgroup size of 32 is unavailable";
++            } else if (!device->subgroup_require_full_support) {
++                rejection_reason = "full compute subgroups are unavailable";
++            } else if (device->subgroup_max_workgroup_subgroups < 16) {
++                rejection_reason = "fewer than 16 required-size subgroups per workgroup are available";
++            } else if (device->properties.limits.maxComputeWorkGroupInvocations < 512 ||
++                       device->properties.limits.maxComputeWorkGroupSize[0] < 512) {
++                rejection_reason = "a 512-invocation compute workgroup is unavailable";
++            } else if (device->properties.limits.maxComputeSharedMemorySize < 2048) {
++                rejection_reason = "less than 2048 bytes of compute shared memory are available";
++#if !defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
++            } else {
++                rejection_reason = "this build does not contain integer-dot-product Vulkan shaders";
++#endif
++            }
++
++            if (rejection_reason != nullptr) {
++                GGML_LOG_ERROR("ggml_vulkan: GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22 rejected: %s\n", rejection_reason);
++                throw std::runtime_error(std::string("GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22 rejected: ") + rejection_reason);
++            }
++            device->rms_norm_mul_q8_1_navi22 = true;
++        } else if (rms_norm_mul_q8_1_navi22_mode_env != nullptr) {
++            GGML_LOG_ERROR("ggml_vulkan: GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22_MODE requires GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22=1\n");
++            throw std::runtime_error("GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22_MODE requires GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22=1");
++        }
++
+         // Shaders
+         // Disable matmul tile sizes early if performance low or not supported
+         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
+@@ -9350,10 +9437,17 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+         }
+     }
+     if (quantize_y) {
+-        if (ctx->prealloc_y_last_pipeline_used != to_q8_1.get() ||
+-            ctx->prealloc_y_last_tensor_used != src1 ||
+-            ctx->prealloc_y_last_decode_vector_staging) {
+-            if (ctx->prealloc_y_need_sync) {
++        const bool q8_cache_hit =
++            ctx->prealloc_y_last_pipeline_used == to_q8_1.get() &&
++            ctx->prealloc_y_last_tensor_used == src1 &&
++            !ctx->prealloc_y_last_decode_vector_staging;
++        if (q8_cache_hit && ctx->prealloc_y_fused_q8_write_pending) {
++            // The fused producer does not contain the standalone quantizer's
++            // trailing barrier. Make its compute write visible before MMVQ
++            // consumes the cached sidecar.
++            ggml_vk_sync_buffers(ctx, subctx);
++        } else if (!q8_cache_hit) {
++            if (ctx->prealloc_y_need_sync || ctx->prealloc_y_fused_q8_write_pending) {
+                 ggml_vk_sync_buffers(ctx, subctx);
+             }
+             ggml_vk_quantize_q8_1(ctx, subctx, d_Qy, d_Y, y_ne);
+@@ -12789,6 +12883,144 @@ static vk_op_rope_push_constants ggml_vk_make_rope_constants(const ggml_tensor *
+     return rope;
+ }
+ 
++static bool ggml_vk_rms_norm_mul_q8_1_navi22_eligible(
++        ggml_backend_vk_context * ctx,
++        const ggml_cgraph * cgraph,
++        int node_idx,
++        const ggml_tensor * activation) {
++    if (!ctx->device->rms_norm_mul_q8_1_navi22 ||
++        ctx->num_additional_fused_ops != 1) {
++        return false;
++    }
++    ++ctx->rms_norm_mul_q8_1_structural;
++    if (node_idx + 2 >= cgraph->n_nodes) {
++        return false;
++    }
++    if (ctx->do_add_rms_partials) {
++        ++ctx->rms_norm_mul_q8_1_partials;
++    } else {
++        ++ctx->rms_norm_mul_q8_1_direct_eligible;
++    }
++
++    // Require the first node after the fused RMSNorm+MUL pair to be the exact
++    // MMVQ consumer. This prevents speculative sidecar writes from surviving
++    // across an unrelated user of the shared prealloc_y scratch buffer.
++    const ggml_tensor * consumer = cgraph->nodes[node_idx + 2];
++    if (consumer->op != GGML_OP_MUL_MAT) {
++        return false;
++    }
++    const ggml_tensor * weight = consumer->src[0];
++    ++ctx->rms_norm_mul_q8_1_next_matmul;
++    if (consumer->src[1] != activation) {
++        return false;
++    }
++    ++ctx->rms_norm_mul_q8_1_activation_match;
++    if (
++        weight == nullptr ||
++        weight->type != GGML_TYPE_Q4_K ||
++        activation->type != GGML_TYPE_F32 ||
++        consumer->type != GGML_TYPE_F32 ||
++        consumer->ne[1] != 1 ||
++        weight->ne[0] != activation->ne[0] ||
++        weight->ne[1] != consumer->ne[0] ||
++        weight->ne[2] != 1 || weight->ne[3] != 1 ||
++        !ggml_vk_dim01_contiguous(weight) ||
++        !ggml_is_contiguous(activation)) {
++        return false;
++    }
++    ++ctx->rms_norm_mul_q8_1_q4_shape;
++
++    const int64_t k64 = activation->ne[0];
++    if ((k64 != 4096 && k64 != 14336) || (k64 % 128) != 0) {
++        return false;
++    }
++    const uint32_t k = (uint32_t) k64;
++    if (!ggml_vk_should_use_mmvq(ctx->device, (uint32_t) weight->ne[1], 1, k, weight->type)) {
++        return false;
++    }
++
++    // Match ggml_vk_mul_mat_vec_q_f16's Q8_1 route selection, including the
++    // requirement that a concrete Q8_1 matvec pipeline exists for this shape.
++    const bool route = ctx->device->integer_dot_product &&
++        ggml_vk_get_dequantize_mul_mat_vec(
++            ctx, weight->type, GGML_TYPE_Q8_1, 1,
++            (uint32_t) consumer->ne[0], k) != nullptr;
++    if (route) {
++        ++ctx->rms_norm_mul_q8_1_route;
++    }
++    return route;
++}
++
++static void ggml_vk_rms_norm_mul_q8_1_navi22(
++        ggml_backend_vk_context * ctx,
++        vk_context & subctx,
++        const ggml_tensor * src0,
++        const ggml_tensor * src1,
++        ggml_tensor * dst,
++        vk_op_binary_push_constants & pc) {
++    const size_t ne = ggml_nelements(dst);
++    const size_t q8_size = ggml_vk_align_size(ne, 128) *
++                           ggml_type_size(GGML_TYPE_Q8_1) /
++                           ggml_blck_size(GGML_TYPE_Q8_1);
++    GGML_ASSERT((ne == 4096 || ne == 14336) && ne % 128 == 0);
++    GGML_ASSERT(q8_size <= ctx->device->properties.limits.maxStorageBufferRange);
++
++    if (ctx->prealloc_size_y < q8_size) {
++        ctx->prealloc_size_y = q8_size;
++        ggml_vk_preallocate_buffers(ctx, subctx);
++    } else if (ctx->prealloc_y == nullptr) {
++        ggml_vk_preallocate_buffers(ctx, subctx);
++    }
++    GGML_ASSERT(ctx->prealloc_y != nullptr && ctx->prealloc_y->size >= q8_size);
++
++    // A previous reader or fused producer may still be using this shared
++    // scratch allocation. Make that access complete before overwriting it.
++    if (ctx->prealloc_y_need_sync || ctx->prealloc_y_fused_q8_write_pending) {
++        ggml_vk_sync_buffers(ctx, subctx);
++    }
++
++    const bool use_partials = ctx->do_add_rms_partials;
++    vk_pipeline pipeline = use_partials ?
++        ctx->device->pipeline_rms_norm_mul_partials_q8_1_x4_navi22 :
++        ctx->device->pipeline_rms_norm_mul_q8_1_x4_navi22;
++    vk_pipeline to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
++    GGML_ASSERT(pipeline != nullptr && to_q8_1 != nullptr);
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++
++    init_pushconst_fastdiv(pc);
++    const vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0, true);
++    const vk_subbuffer src1_buf = ggml_vk_tensor_subbuffer(ctx, src1, true);
++    const vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst, true);
++    const vk_subbuffer q8_buf = { ctx->prealloc_y, 0, q8_size };
++    init_pushconst_tensor_offsets(ctx, pc, src0, src1, nullptr, nullptr, dst);
++
++    if (use_partials) {
++        const vk_subbuffer partials_buf = ggml_vk_subbuffer(
++            ctx, ctx->prealloc_add_rms_partials, ctx->prealloc_size_add_rms_partials_offset);
++        ggml_vk_dispatch_pipeline(
++            ctx, subctx, pipeline,
++            { src0_buf, src1_buf, dst_buf, partials_buf, q8_buf },
++            pc, { (uint32_t) CEIL_DIV(ne, 128), 1, 1 });
++        ++ctx->rms_norm_mul_q8_1_partial_dispatches;
++    } else {
++        ggml_vk_dispatch_pipeline(
++            ctx, subctx, pipeline,
++            { src0_buf, src1_buf, dst_buf, q8_buf },
++            pc, { 1, 1, 1 });
++        ++ctx->rms_norm_mul_q8_1_direct_dispatches;
++    }
++
++    // Publish exactly the identity expected by the standalone Q8_1 cache
++    // check. The pending flag supplies the barrier normally emitted by
++    // ggml_vk_quantize_q8_1 before an MMVQ consumer reads this sidecar.
++    ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
++    ctx->prealloc_y_last_tensor_used = dst;
++    ctx->prealloc_y_last_decode_vector_staging = false;
++    ctx->prealloc_y_fused_q8_write_pending = true;
++    ctx->prealloc_y_need_sync = true;
++    ++ctx->rms_norm_mul_q8_1_dispatches;
++}
++
+ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, float * op_params) {
+     ggml_tensor * dst;
+     const ggml_tensor * src0;
+@@ -12898,6 +13130,12 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx,
+                 ggml_vk_subbuffer(ctx, buf[5], offset[5]),
+                 ggml_vk_subbuffer(ctx, buf[6], offset[6]),
+             }, pc, elements);
++    } else if (ggml_vk_rms_norm_mul_q8_1_navi22_eligible(ctx, cgraph, node_idx, dst) &&
++               src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
++               ggml_nrows(src0) == 1 && ggml_nrows(src1) == 1 && ggml_nrows(dst) == 1 &&
++               src0->ne[0] == dst->ne[0] && src1->ne[0] == dst->ne[0] &&
++               ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
++        ggml_vk_rms_norm_mul_q8_1_navi22(ctx, subctx, src0, src1, dst, bin);
+     } else {
+         ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
+     }
+@@ -14745,6 +14983,7 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
+         ctx->prealloc_y_last_pipeline_used = nullptr;
+         ctx->prealloc_y_last_tensor_used = nullptr;
+         ctx->prealloc_y_last_decode_vector_staging = false;
++        ctx->prealloc_y_fused_q8_write_pending = false;
+     }
+     if (ctx->prealloc_split_k == nullptr || (ctx->prealloc_size_split_k > 0 && ctx->prealloc_split_k->size < ctx->prealloc_size_split_k)) {
+         VK_LOG_MEMORY("ggml_vk_preallocate_buffers(split_k_size: " << ctx->prealloc_size_split_k << ")");
+@@ -15342,6 +15581,7 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
+     ctx->prealloc_y_last_pipeline_used = {};
+     ctx->prealloc_y_last_tensor_used = nullptr;
+     ctx->prealloc_y_last_decode_vector_staging = false;
++    ctx->prealloc_y_fused_q8_write_pending = false;
+ 
+     ctx->unsynced_nodes_written.clear();
+     ctx->unsynced_nodes_read.clear();
+@@ -15394,6 +15634,7 @@ static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
+     ctx->prealloc_y_last_pipeline_used = nullptr;
+     ctx->prealloc_y_last_tensor_used = nullptr;
+     ctx->prealloc_y_last_decode_vector_staging = false;
++    ctx->prealloc_y_fused_q8_write_pending = false;
+ 
+     ctx->prealloc_size_x = 0;
+     ctx->prealloc_size_y = 0;
+@@ -16562,6 +16803,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     ctx->prealloc_y_last_pipeline_used = nullptr;
+     ctx->prealloc_y_last_tensor_used = nullptr;
+     ctx->prealloc_y_last_decode_vector_staging = false;
++    ctx->prealloc_y_fused_q8_write_pending = false;
+ 
+     if (ctx->prealloc_size_add_rms_partials) {
+         ggml_vk_preallocate_buffers(ctx, nullptr);
+@@ -16580,6 +16822,16 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     uint64_t batch_flops = 0;
+     uint64_t total_flops = 0;
+     uint64_t flops_cap = 200'000'000'000ULL;
++    ctx->rms_norm_mul_q8_1_structural = 0;
++    ctx->rms_norm_mul_q8_1_partials = 0;
++    ctx->rms_norm_mul_q8_1_direct_eligible = 0;
++    ctx->rms_norm_mul_q8_1_next_matmul = 0;
++    ctx->rms_norm_mul_q8_1_activation_match = 0;
++    ctx->rms_norm_mul_q8_1_q4_shape = 0;
++    ctx->rms_norm_mul_q8_1_route = 0;
++    ctx->rms_norm_mul_q8_1_dispatches = 0;
++    ctx->rms_norm_mul_q8_1_partial_dispatches = 0;
++    ctx->rms_norm_mul_q8_1_direct_dispatches = 0;
+ 
+     // On weaker AMD GPUs larger submissions can hit a driver timeout, submit more often to avoid this
+     if (ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->shader_core_count > 0) {
+@@ -16859,6 +17111,27 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+ 
+     ctx->last_total_flops = total_flops;
+ 
++    if (ctx->device->rms_norm_mul_q8_1_navi22 &&
++        ctx->rms_norm_mul_q8_1_dispatches != 0 &&
++        !ctx->device->rms_norm_mul_q8_1_navi22_diagnostic_logged.exchange(true)) {
++        fprintf(
++            stderr,
++            "ggml_vulkan: fused RMSNorm+MUL -> Q8_1_x4 Navi22 ACTIVE "
++            "(mode=direct structural=%u partials=%u direct_eligible=%u next_matmul=%u "
++            "activation_match=%u q4_shape=%u route=%u dispatched=%u "
++            "partial_dispatches=%u direct_dispatches=%u wave32)\n",
++            ctx->rms_norm_mul_q8_1_structural,
++            ctx->rms_norm_mul_q8_1_partials,
++            ctx->rms_norm_mul_q8_1_direct_eligible,
++            ctx->rms_norm_mul_q8_1_next_matmul,
++            ctx->rms_norm_mul_q8_1_activation_match,
++            ctx->rms_norm_mul_q8_1_q4_shape,
++            ctx->rms_norm_mul_q8_1_route,
++            ctx->rms_norm_mul_q8_1_dispatches,
++            ctx->rms_norm_mul_q8_1_partial_dispatches,
++            ctx->rms_norm_mul_q8_1_direct_dispatches);
++    }
++
+     if (vk_perf_logger_enabled) {
+         // End the command buffer and submit/wait
+         GGML_ASSERT(!ctx->compute_ctx.expired());
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm_mul_partials_q8_1_x4_navi22.comp b/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm_mul_partials_q8_1_x4_navi22.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..81d54fad3f631542873298a3ec6de72827850193
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm_mul_partials_q8_1_x4_navi22.comp
+@@ -0,0 +1,126 @@
++#version 450
++
++// Decode-only experiment: finish the partials RMSNorm+MUL operation and
++// produce the Q8_1_x4 staging representation consumed by the integer-dot
++// mat-vec path in the same dispatch.
++//
++// Host contract:
++//   * A_TYPE, B_TYPE, D_TYPE, and FLOAT_TYPE are float.
++//   * specialization constant 1 (do_multiply) is true.
++//   * local size is 128 and the pipeline requests a full 32-lane subgroup.
++//   * each workgroup covers one contiguous, 128-element-aligned output chunk.
++//   * binding 4 starts at the beginning of a suitably sized/aligned Q8_1
++//     sidecar buffer (one block_q8_1_x4, 144 bytes, per workgroup).
++//
++// Binding 0/1/2/3 and the push constants intentionally retain the exact ABI
++// of rms_norm_partials.comp. Binding 4 is the only ABI addition.
++
++#include "generic_binary_head.glsl"
++#include "types.glsl"
++
++#extension GL_EXT_control_flow_attributes : enable
++#extension GL_KHR_shader_subgroup_arithmetic : require
++#extension GL_KHR_shader_subgroup_basic : require
++#extension GL_KHR_shader_subgroup_clustered : require
++
++#define BLOCK_SIZE 128
++
++layout (constant_id = 1) const bool do_multiply = false;
++
++layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 3, std430) readonly buffer PartialsBuf {float partial_sums[];};
++layout (binding = 4, std430) writeonly buffer Q8Buf {block_q8_1_x4 data_q8[];};
++
++shared FLOAT_TYPE sumsh[BLOCK_SIZE];
++shared float q8_values[BLOCK_SIZE];
++
++void main() {
++    const uint ncols     = p.ne00;
++    const uint nchunks   = gl_NumWorkGroups.x;
++    const uint nchannels = gl_NumWorkGroups.y;
++
++    const uint row       = 0;
++    const uint channel   = gl_WorkGroupID.y;
++    const uint samp      = gl_WorkGroupID.z;
++    // The work is split across multiple workgroups in the x dimension. Each
++    // invocation processes one element.
++    const uint tid       = gl_GlobalInvocationID.x;
++    const uint ltid      = gl_LocalInvocationID.x;
++
++    const uint stride_row       = p.nb01;
++    const uint stride_channel   = p.nb02;
++    const uint stride_sample    = p.nb03;
++
++    uint32_t a_offset = samp*stride_sample + channel*stride_channel + row*stride_row + get_aoffset();
++    uint32_t b_offset = src1_idx(0, row, channel, samp) + get_boffset();
++    uint32_t d_offset = ((samp*nchannels + channel)*nchunks + row)*ncols + get_doffset();
++
++    FLOAT_TYPE sum = FLOAT_TYPE(0.0f); // partial sum for thread in warp
++
++    uint32_t num_partials = p.param3;
++    for (uint32_t i = gl_SubgroupInvocationID; i < num_partials; i += gl_SubgroupSize) {
++        sum += partial_sums[i];
++    }
++    sum = subgroupAdd(sum);
++
++    // q8_values holds exactly the F32 value written to binding 2. Keeping the
++    // sidecar source in shared memory avoids a storage-buffer read-after-write
++    // and its extra buffer memory barrier.
++    float produced = 0.0f;
++    const uint col = tid;
++    if (col < ncols) {
++        const FLOAT_TYPE mean = sum / FLOAT_TYPE(ncols);
++        const FLOAT_TYPE scale = inversesqrt(mean + FLOAT_TYPE(p.param1));
++
++        if (do_multiply) {
++            if (ncols > p.ne10) {
++                produced = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + fastmod(col, p.ne10)])));
++            } else {
++                produced = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col]) * FLOAT_TYPE(data_b[b_offset + col])));
++            }
++        } else {
++            produced = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + col])));
++        }
++        data_d[d_offset + col] = D_TYPE(produced);
++    }
++    q8_values[ltid] = produced;
++
++    // All four waves finish the F32 producer before wave 0 consumes its 128
++    // values as 32 vec4s. Host routing is restricted to wave32/full-subgroup
++    // devices, so these lanes map exactly to quantize_q8_1.comp's subgroup
++    // QBLOCK_X4 layout: four adjacent 8-lane clusters, one Q8_1 block each.
++    barrier();
++
++    if (gl_SubgroupID != 0) {
++        return;
++    }
++
++    const uint lane = gl_SubgroupInvocationID;
++    const uint block_in_x4 = lane / 8;
++    const uint iqs = lane % 8;
++    const uint value_base = lane * 4;
++    const uint q8_outer = (samp*nchannels + channel)*nchunks + gl_WorkGroupID.x;
++
++    vec4 vals = vec4(q8_values[value_base + 0],
++                     q8_values[value_base + 1],
++                     q8_values[value_base + 2],
++                     q8_values[value_base + 3]);
++    const vec4 abs_vals = abs(vals);
++
++    // This sequence deliberately matches quantize_q8_1.comp's subgroup path,
++    // including its operation order, redundant final round, and FP16 ds store.
++    const float thread_max = max(max(abs_vals.x, abs_vals.y), max(abs_vals.z, abs_vals.w));
++    const float amax = subgroupClusteredMax(thread_max, 8);
++    const float d = amax / 127.0;
++    const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
++    vals = round(vals * d_inv);
++
++    data_q8[q8_outer].qs[block_in_x4 * 8 + iqs] = pack32(i8vec4(round(vals)));
++
++    const float thread_sum = vals.x + vals.y + vals.z + vals.w;
++    const float qsum = subgroupClusteredAdd(thread_sum, 8);
++    if (iqs == 0) {
++        data_q8[q8_outer].ds[block_in_x4] = f16vec2(vec2(d, qsum * d));
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm_mul_q8_1_x4_navi22.comp b/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm_mul_q8_1_x4_navi22.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc97db2088ba8ec092feb87cca58a62e329ca940
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/rms_norm_mul_q8_1_x4_navi22.comp
+@@ -0,0 +1,135 @@
++#version 450
++
++// Decode-only Navi22 experiment: retain the standard 512-thread F32
++// RMSNorm+MUL reduction while producing the Q8_1_x4 activation sidecar in the
++// same dispatch. Host routing is restricted to one contiguous row with width
++// 4096 or 14336 and to full 32-lane subgroups.
++
++#include "generic_binary_head.glsl"
++#include "types.glsl"
++
++#extension GL_EXT_control_flow_attributes : enable
++#extension GL_KHR_shader_subgroup_arithmetic : require
++#extension GL_KHR_shader_subgroup_basic : require
++#extension GL_KHR_shader_subgroup_clustered : require
++
++#define BLOCK_SIZE 512
++#define WAVES_PER_WORKGROUP 16
++
++layout (constant_id = 1) const bool do_multiply = false;
++
++layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 3, std430) writeonly buffer Q8Buf {block_q8_1_x4 data_q8[];};
++
++shared FLOAT_TYPE sumsh[BLOCK_SIZE];
++
++void rms_norm_mul_q8(uint num_iters, uint q8_iters) {
++    const uint ncols     = p.ne00;
++    const uint nrows     = gl_NumWorkGroups.x;
++    const uint nchannels = gl_NumWorkGroups.y;
++
++    const uint row       = gl_WorkGroupID.x;
++    const uint channel   = gl_WorkGroupID.y;
++    const uint samp      = gl_WorkGroupID.z;
++    const uint tid       = gl_LocalInvocationID.x;
++
++    const uint stride_row       = p.nb01;
++    const uint stride_channel   = p.nb02;
++    const uint stride_sample    = p.nb03;
++
++    const uint32_t a_offset = samp*stride_sample + channel*stride_channel + row*stride_row + get_aoffset();
++    const uint32_t b_offset = src1_idx(0, row, channel, samp) + get_boffset();
++    const uint32_t d_offset = ((samp*nchannels + channel)*nrows + row)*ncols + get_doffset();
++
++    // This is the standard rms_norm.comp reduction. Width 14336 deliberately
++    // executes 32 iterations with zero-valued tail elements.
++    FLOAT_TYPE sum = FLOAT_TYPE(0.0f);
++    [[unroll]] for (uint col = tid, idx = 0; idx < num_iters; col += BLOCK_SIZE, ++idx) {
++        FLOAT_TYPE xi = FLOAT_TYPE(0);
++        if (col < ncols) {
++            xi = FLOAT_TYPE(data_a[a_offset + col]);
++        }
++        sum += xi * xi;
++    }
++
++    sumsh[tid] = sum;
++    barrier();
++    [[unroll]] for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
++        if (tid < s) {
++            sum += sumsh[tid + s];
++            sumsh[tid] = sum;
++        }
++        barrier();
++    }
++    sum = sumsh[0];
++
++    const FLOAT_TYPE mean = sum / FLOAT_TYPE(ncols);
++    const FLOAT_TYPE scale = inversesqrt(mean + FLOAT_TYPE(p.param1));
++
++    // Sixteen wave32s cover sixteen consecutive 128-value Q8_1_x4 chunks per
++    // iteration. Each lane owns four contiguous values, matching the
++    // standalone quantizer's byte order: two iterations at 4096, seven at
++    // 14336.
++    const uint wave = gl_SubgroupID;
++    const uint lane = gl_SubgroupInvocationID;
++    const uint block_in_x4 = lane / 8;
++    const uint iqs = lane % 8;
++    const uint q8_row_base = ((samp*nchannels + channel)*nrows + row)*(ncols / 128);
++
++    [[unroll]] for (uint q8_iter = 0; q8_iter < q8_iters; ++q8_iter) {
++        const uint chunk = wave + q8_iter*WAVES_PER_WORKGROUP;
++        const uint value_base = chunk*128 + lane*4;
++
++        vec4 vals;
++        if (do_multiply) {
++            if (ncols > p.ne10) {
++                vals.x = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + value_base + 0]) * FLOAT_TYPE(data_b[b_offset + fastmod(value_base + 0, p.ne10)])));
++                vals.y = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + value_base + 1]) * FLOAT_TYPE(data_b[b_offset + fastmod(value_base + 1, p.ne10)])));
++                vals.z = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + value_base + 2]) * FLOAT_TYPE(data_b[b_offset + fastmod(value_base + 2, p.ne10)])));
++                vals.w = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + value_base + 3]) * FLOAT_TYPE(data_b[b_offset + fastmod(value_base + 3, p.ne10)])));
++            } else {
++                vals.x = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + value_base + 0]) * FLOAT_TYPE(data_b[b_offset + value_base + 0])));
++                vals.y = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + value_base + 1]) * FLOAT_TYPE(data_b[b_offset + value_base + 1])));
++                vals.z = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + value_base + 2]) * FLOAT_TYPE(data_b[b_offset + value_base + 2])));
++                vals.w = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + value_base + 3]) * FLOAT_TYPE(data_b[b_offset + value_base + 3])));
++            }
++        } else {
++            vals.x = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + value_base + 0])));
++            vals.y = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + value_base + 1])));
++            vals.z = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + value_base + 2])));
++            vals.w = float(D_TYPE(scale * FLOAT_TYPE(data_a[a_offset + value_base + 3])));
++        }
++
++        data_d[d_offset + value_base + 0] = D_TYPE(vals.x);
++        data_d[d_offset + value_base + 1] = D_TYPE(vals.y);
++        data_d[d_offset + value_base + 2] = D_TYPE(vals.z);
++        data_d[d_offset + value_base + 3] = D_TYPE(vals.w);
++
++        // Match quantize_q8_1.comp and the proven partial fused shader exactly,
++        // including the redundant final round and FP16 ds conversion.
++        const vec4 abs_vals = abs(vals);
++        const float thread_max = max(max(abs_vals.x, abs_vals.y), max(abs_vals.z, abs_vals.w));
++        const float amax = subgroupClusteredMax(thread_max, 8);
++        const float d = amax / 127.0;
++        const float d_inv = d != 0.0 ? 1.0 / d : 0.0;
++        vals = round(vals * d_inv);
++
++        const uint q8_outer = q8_row_base + chunk;
++        data_q8[q8_outer].qs[block_in_x4 * 8 + iqs] = pack32(i8vec4(round(vals)));
++
++        const float thread_sum = vals.x + vals.y + vals.z + vals.w;
++        const float qsum = subgroupClusteredAdd(thread_sum, 8);
++        if (iqs == 0) {
++            data_q8[q8_outer].ds[block_in_x4] = f16vec2(vec2(d, qsum * d));
++        }
++    }
++}
++
++void main() {
++    if (p.ne00 == 4096) {
++        rms_norm_mul_q8(8, 2);
++    } else if (p.ne00 == 14336) {
++        rms_norm_mul_q8(32, 7);
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 58d347bc547d75fa891bd34003067b7655f0c36c..df9c2bc6868320755a62f5e4fea099f5b18c7bb0 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -799,6 +799,8 @@ void process_shaders() {
+     string_to_spv("group_norm_f32", "group_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("rms_norm_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("rms_norm_partials_f32", "rms_norm_partials.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
++    string_to_spv("rms_norm_mul_partials_q8_1_x4_navi22", "rms_norm_mul_partials_q8_1_x4_navi22.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
++    string_to_spv("rms_norm_mul_q8_1_x4_navi22", "rms_norm_mul_q8_1_x4_navi22.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("rms_norm_mul_rope_f32_f32", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"ROPE_D_TYPE", "float"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
+     string_to_spv("rms_norm_mul_rope_f32_f16", "rms_norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}, {"RMS_NORM_ROPE_FUSION", "1"}}));
+     string_to_spv("rms_norm_back_f32", "rms_norm_back.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));

@@ -1,0 +1,786 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: austxu <austxu@users.noreply.github.com>
+Date: Thu, 16 Jul 2026 21:43:00 -0700
+Subject: [PATCH 6/9] vulkan: co-dispatch Llama 2 Q4_0 projections
+
+Add a strict RX 6700 XT opt-in that groups QKV and FFN gate/up Q4_0 matvecs sharing one decode activation into a single Vulkan dispatch. Preserve fallback behavior and record exact group coverage.
+
+Assisted-by: Codex <noreply@openai.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 433 ++++++++++++++++--
+ .../mul_mat_vec_q4_0_multiproj_navi22.comp    | 136 ++++++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |   7 +
+ tests/test-backend-ops.cpp                    |  11 +-
+ 4 files changed, 560 insertions(+), 27 deletions(-)
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_0_multiproj_navi22.comp
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 5c07bed951e00152ac8d7ed8ac81999675a0bdf3..13c0a24dd533324cc8bb0cfd536db8a4b718e2a1 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -750,6 +750,9 @@ struct vk_device_struct {
+     bool q4_0_mmvq_navi22 {};
+     std::atomic<bool> q4_0_mmvq_navi22_banner_logged {};
+     std::atomic<bool> q4_0_mmvq_navi22_diagnostic_logged {};
++    bool q4_0_multiproj_navi22 {};
++    std::atomic<bool> q4_0_multiproj_navi22_banner_logged {};
++    std::atomic<bool> q4_0_multiproj_navi22_diagnostic_logged {};
+     bool rms_norm_mul_q8_1_navi22 {};
+     std::atomic<bool> rms_norm_mul_q8_1_navi22_diagnostic_logged {};
+ 
+@@ -835,6 +838,7 @@ struct vk_device_struct {
+ 
+     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
+     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
++    vk_pipeline pipeline_q4_0_multiproj_navi22;
+ 
+     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
+     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
+@@ -1155,6 +1159,15 @@ struct vk_mat_vec_push_constants {
+     uint32_t broadcast3;
+ };
+ 
++struct vk_q4_0_multiproj_push_constants {
++    uint32_t ncols;
++    uint32_t nrows;
++    uint32_t projection_count;
++    uint32_t a_block_offset0;
++    uint32_t a_block_offset1;
++    uint32_t a_block_offset2;
++};
++
+ struct vk_mat_vec_p021_push_constants {
+     uint32_t ncols_x;
+     uint32_t nrows_x;
+@@ -2211,6 +2224,11 @@ struct ggml_backend_vk_context {
+     uint32_t rms_norm_mul_q8_1_partial_dispatches {};
+     uint32_t rms_norm_mul_q8_1_direct_dispatches {};
+     uint32_t q4_0_mmvq_navi22_dispatches {};
++    uint32_t q4_0_multiproj_count {};
++    uint32_t q4_0_multiproj_groups {};
++    uint32_t q4_0_multiproj_qkv_groups {};
++    uint32_t q4_0_multiproj_ffn_groups {};
++    uint32_t q4_0_multiproj_logical_dispatches {};
+     topk_moe_mode fused_topk_moe_mode {};
+     bool fused_topk_moe_scale {};
+ 
+@@ -4946,6 +4964,19 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     static constexpr uint32_t mul_mat_vec_num_bindings = 5;
+     static constexpr uint32_t mul_mat_vec_id_num_bindings = 6;
+ 
++#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
++    if (device->q4_0_multiproj_navi22) {
++        ggml_vk_create_pipeline(
++            device,
++            device->pipeline_q4_0_multiproj_navi22,
++            "mul_mat_vec_q4_0_q8_1_f32_multiproj_navi22",
++            mul_mat_vec_q4_0_q8_1_f32_multiproj_navi22_len,
++            mul_mat_vec_q4_0_q8_1_f32_multiproj_navi22_data,
++            "main", 5, sizeof(vk_q4_0_multiproj_push_constants), {2, 1, 1}, {}, 1,
++            true, true, 64);
++    }
++#endif
++
+ #if defined(GGML_VULKAN_FLOAT_E2M1_GLSLC_SUPPORT) && defined(GGML_VULKAN_FLOAT_E4M3_GLSLC_SUPPORT)
+ #define OCP_DMMV_LEN(NAME, REDUC)  (device->ocp_fp4 ? NAME ## _ocp_len[REDUC]  : NAME ## _len[REDUC])
+ #define OCP_DMMV_DATA(NAME, REDUC) (device->ocp_fp4 ? NAME ## _ocp_data[REDUC] : NAME ## _data[REDUC])
+@@ -5889,6 +5920,10 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             !device->q4_0_mmvq_navi22_banner_logged.exchange(true)) {
+             fprintf(stderr, "ggml_vulkan: selected Q4_0 x Q8_1 Navi22 MMVQ route (n=1, wave64, 2 rows/workgroup)\n");
+         }
++        if (task.pipeline->name == "mul_mat_vec_q4_0_q8_1_f32_multiproj_navi22" &&
++            !device->q4_0_multiproj_navi22_banner_logged.exchange(true)) {
++            fprintf(stderr, "ggml_vulkan: selected Q4_0 Navi22 multi-projection MMVQ route (wave64, 2 rows/workgroup)\n");
++        }
+     }
+ 
+     // Another thread may be compiling the pipeline we need; block on it here.
+@@ -6750,6 +6785,38 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             device->q4_0_mmvq_navi22 = true;
+         }
+ 
++        const char * q4_0_multiproj_navi22_env = getenv("GGML_VK_Q4_0_MULTIPROJ_NAVI22");
++        if (getenv("GGML_VK_Q4_0_MULTIPROJ_NAVI22_MODE") != nullptr ||
++            getenv("GGML_VK_Q4_0_MULTIPROJ_NAVI22_ROWS") != nullptr ||
++            getenv("GGML_VK_Q4_0_MULTIPROJ_NAVI22_COUNT") != nullptr) {
++            GGML_LOG_ERROR("ggml_vulkan: legacy Q4_0 Navi22 multi-projection mode/rows/count selectors are unsupported\n");
++            throw std::runtime_error("legacy Q4_0 Navi22 multi-projection mode/rows/count selectors are unsupported");
++        }
++        if (q4_0_multiproj_navi22_env != nullptr) {
++            const char * rejection_reason = nullptr;
++            if (strcmp(q4_0_multiproj_navi22_env, "1") != 0) {
++                rejection_reason = "the environment value must be exactly 1";
++            } else if (q4_0_mmvq_navi22_env == nullptr ||
++                       strcmp(q4_0_mmvq_navi22_env, "1") != 0 ||
++                       !device->q4_0_mmvq_navi22) {
++                rejection_reason = "GGML_VK_Q4_0_MMVQ_NAVI22=1 is required";
++            } else if (getenv("GGML_VK_DISABLE_FUSION") != nullptr) {
++                rejection_reason = "GGML_VK_DISABLE_FUSION must be unset";
++            } else if (getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE") != nullptr) {
++                rejection_reason = "GGML_VK_DISABLE_GRAPH_OPTIMIZE must be unset";
++#if !defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
++            } else {
++                rejection_reason = "this build does not contain integer-dot-product Vulkan shaders";
++#endif
++            }
++
++            if (rejection_reason != nullptr) {
++                GGML_LOG_ERROR("ggml_vulkan: GGML_VK_Q4_0_MULTIPROJ_NAVI22 rejected: %s\n", rejection_reason);
++                throw std::runtime_error(std::string("GGML_VK_Q4_0_MULTIPROJ_NAVI22 rejected: ") + rejection_reason);
++            }
++            device->q4_0_multiproj_navi22 = true;
++        }
++
+         const char * rms_norm_mul_q8_1_navi22_env = getenv("GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22");
+         const char * rms_norm_mul_q8_1_navi22_mode_env = getenv("GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22_MODE");
+         if (rms_norm_mul_q8_1_navi22_env != nullptr) {
+@@ -9601,6 +9668,231 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+     }
+ }
+ 
++static uint32_t ggml_vk_q4_0_multiproj_expected_count(const ggml_tensor * node) {
++    if (node == nullptr || node->op != GGML_OP_MUL_MAT || node->src[0] == nullptr || node->src[1] == nullptr) {
++        return 0;
++    }
++
++    const ggml_tensor * weight = node->src[0];
++    const ggml_tensor * activation = node->src[1];
++    if (weight->op != GGML_OP_NONE ||
++        weight->type != GGML_TYPE_Q4_0 || activation->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32 ||
++        weight->ne[0] != 4096 || activation->ne[0] != 4096 ||
++        weight->ne[1] != node->ne[0] ||
++        weight->ne[2] != 1 || weight->ne[3] != 1 ||
++        activation->ne[1] != 1 || activation->ne[2] != 1 || activation->ne[3] != 1 ||
++        node->ne[1] != 1 || node->ne[2] != 1 || node->ne[3] != 1 ||
++        !ggml_is_contiguous(weight) || !ggml_is_contiguous(activation) || !ggml_is_contiguous(node)) {
++        return 0;
++    }
++
++    if (node->ne[0] == 4096) {
++        return 3;
++    }
++    if (node->ne[0] == 11008) {
++        return 2;
++    }
++    return 0;
++}
++
++static bool ggml_vk_q4_0_multiproj_matches(const ggml_tensor * first, const ggml_tensor * node) {
++    const uint32_t expected = ggml_vk_q4_0_multiproj_expected_count(first);
++    return expected != 0 &&
++           ggml_vk_q4_0_multiproj_expected_count(node) == expected &&
++           node->src[1] == first->src[1] &&
++           node->src[0] != first->src[0] &&
++           memcmp(node->op_params, first->op_params, GGML_MAX_OP_PARAMS) == 0;
++}
++
++static uint32_t ggml_vk_q4_0_multiproj_eligible(
++        ggml_backend_vk_context * ctx,
++        const ggml_cgraph * cgraph,
++        int node_idx) {
++    if (!ctx->device->q4_0_multiproj_navi22 || node_idx < 0 || node_idx >= cgraph->n_nodes) {
++        return 0;
++    }
++
++    const ggml_tensor * first = cgraph->nodes[node_idx];
++    const uint32_t count = ggml_vk_q4_0_multiproj_expected_count(first);
++    if (count == 0 || node_idx + (int) count > cgraph->n_nodes) {
++        return 0;
++    }
++
++    for (uint32_t i = 0; i < count; ++i) {
++        const ggml_tensor * node = cgraph->nodes[node_idx + i];
++        if ((i != 0 && !ggml_vk_q4_0_multiproj_matches(first, node)) ||
++            node->src[0]->buffer == nullptr || node->src[1]->buffer == nullptr || node->buffer == nullptr ||
++            get_misalign_bytes(ctx, node->src[0]) != 0 ||
++            get_misalign_bytes(ctx, node->src[1]) != 0 ||
++            get_misalign_bytes(ctx, node) != 0) {
++            return 0;
++        }
++        for (uint32_t j = 0; j < i; ++j) {
++            if (node == cgraph->nodes[node_idx + j] ||
++                node->src[0] == cgraph->nodes[node_idx + j]->src[0]) {
++                return 0;
++            }
++        }
++    }
++
++    uint32_t graph_matches = 0;
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        if (cgraph->nodes[i] == first || ggml_vk_q4_0_multiproj_matches(first, cgraph->nodes[i])) {
++            ++graph_matches;
++        }
++    }
++    if (graph_matches != count) {
++        return 0;
++    }
++
++    if (ctx->device->pipeline_q4_0_multiproj_navi22 == nullptr ||
++        !ggml_vk_should_use_mmvq(ctx->device, (uint32_t) first->ne[0], 1, 4096, GGML_TYPE_Q4_0) ||
++        ctx->device->properties.limits.maxComputeWorkGroupCount[0] < (uint32_t) CEIL_DIV(first->ne[0], 2) ||
++        ctx->device->properties.limits.maxComputeWorkGroupCount[1] < count ||
++        ctx->device->properties.limits.maxPushConstantsSize < sizeof(vk_q4_0_multiproj_push_constants)) {
++        return 0;
++    }
++
++    std::array<vk_subbuffer, 3> weights {};
++    std::array<vk_subbuffer, 3> outputs {};
++    for (uint32_t i = 0; i < count; ++i) {
++        weights[i] = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + i]->src[0]);
++        outputs[i] = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + i]);
++    }
++
++    const vk_buffer weight_buffer = weights[0].buffer;
++    uint64_t span_begin = weights[0].offset;
++    uint64_t span_end = weights[0].offset + weights[0].size;
++    for (uint32_t i = 0; i < count; ++i) {
++        if (weights[i].buffer != weight_buffer || weights[i].size != ggml_nbytes(cgraph->nodes[node_idx + i]->src[0])) {
++            return 0;
++        }
++        span_begin = std::min(span_begin, weights[i].offset);
++        span_end = std::max(span_end, weights[i].offset + weights[i].size);
++    }
++
++    const uint64_t block_bytes = ggml_type_size(GGML_TYPE_Q4_0);
++    if (span_end <= span_begin || span_end > weight_buffer->size ||
++        span_end - span_begin > ctx->device->properties.limits.maxStorageBufferRange) {
++        return 0;
++    }
++    for (uint32_t i = 0; i < count; ++i) {
++        const uint64_t relative = weights[i].offset - span_begin;
++        if (relative % block_bytes != 0 || relative / block_bytes > std::numeric_limits<uint32_t>::max() ||
++            outputs[i].size > ctx->device->properties.limits.maxStorageBufferRange) {
++            return 0;
++        }
++    }
++
++    const vk_subbuffer activation = ggml_vk_tensor_subbuffer(ctx, first->src[1]);
++    auto const &overlap = [](const vk_subbuffer & a, const vk_subbuffer & b) {
++        return a.buffer == b.buffer && a.offset < b.offset + b.size && b.offset < a.offset + a.size;
++    };
++    for (uint32_t i = 0; i < count; ++i) {
++        if (overlap(outputs[i], activation)) {
++            return 0;
++        }
++        for (uint32_t j = 0; j < count; ++j) {
++            if (overlap(outputs[i], weights[j]) || (i != j && overlap(outputs[i], outputs[j]))) {
++                return 0;
++            }
++        }
++    }
++
++    return count;
++}
++
++static void ggml_vk_q4_0_multiproj(
++        ggml_backend_vk_context * ctx,
++        vk_context & subctx,
++        const ggml_cgraph * cgraph,
++        int node_idx) {
++    const uint32_t count = ctx->q4_0_multiproj_count;
++    GGML_ASSERT(count == 2 || count == 3);
++    GGML_ASSERT(node_idx >= 0 && node_idx + (int) count <= cgraph->n_nodes);
++    GGML_ASSERT(ggml_vk_q4_0_multiproj_expected_count(cgraph->nodes[node_idx]) == count);
++    for (uint32_t i = 1; i < count; ++i) {
++        GGML_ASSERT(ggml_vk_q4_0_multiproj_matches(cgraph->nodes[node_idx], cgraph->nodes[node_idx + i]));
++    }
++
++    const ggml_tensor * activation = cgraph->nodes[node_idx]->src[1];
++    const uint64_t activation_ne = ggml_nelements(activation);
++    const uint64_t q8_size = ggml_vk_align_size(activation_ne, 128) *
++                             ggml_type_size(GGML_TYPE_Q8_1) /
++                             ggml_blck_size(GGML_TYPE_Q8_1);
++    GGML_ASSERT(activation_ne == 4096 && q8_size <= ctx->device->properties.limits.maxStorageBufferRange);
++
++    if (ctx->prealloc_size_y < q8_size) {
++        ctx->prealloc_size_y = q8_size;
++        ggml_vk_preallocate_buffers(ctx, subctx);
++    } else if (ctx->prealloc_y == nullptr) {
++        ggml_vk_preallocate_buffers(ctx, subctx);
++    }
++    GGML_ASSERT(ctx->prealloc_y != nullptr && ctx->prealloc_y->size >= q8_size);
++
++    vk_pipeline to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
++    const vk_subbuffer activation_buf = ggml_vk_tensor_subbuffer(ctx, activation);
++    const vk_subbuffer q8_buf = {ctx->prealloc_y, 0, q8_size};
++    const bool q8_cache_hit =
++        ctx->prealloc_y_last_pipeline_used == to_q8_1.get() &&
++        ctx->prealloc_y_last_tensor_used == activation &&
++        !ctx->prealloc_y_last_decode_vector_staging;
++    if (q8_cache_hit && ctx->prealloc_y_fused_q8_write_pending) {
++        ggml_vk_sync_buffers(ctx, subctx);
++    } else if (!q8_cache_hit) {
++        if (ctx->prealloc_y_need_sync || ctx->prealloc_y_fused_q8_write_pending) {
++            ggml_vk_sync_buffers(ctx, subctx);
++        }
++        ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
++        ggml_vk_quantize_q8_1(ctx, subctx, activation_buf, q8_buf, activation_ne);
++        ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
++        ctx->prealloc_y_last_tensor_used = activation;
++        ctx->prealloc_y_last_decode_vector_staging = false;
++    }
++
++    std::array<vk_subbuffer, 3> weights {};
++    std::array<vk_subbuffer, 3> outputs {};
++    uint64_t span_begin = std::numeric_limits<uint64_t>::max();
++    uint64_t span_end = 0;
++    for (uint32_t i = 0; i < count; ++i) {
++        weights[i] = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + i]->src[0]);
++        outputs[i] = ggml_vk_tensor_subbuffer(ctx, cgraph->nodes[node_idx + i]);
++        span_begin = std::min(span_begin, weights[i].offset);
++        span_end = std::max(span_end, weights[i].offset + weights[i].size);
++    }
++    const vk_subbuffer weight_span = {weights[0].buffer, span_begin, span_end - span_begin};
++    if (count == 2) {
++        outputs[2] = outputs[1];
++    }
++
++    const uint64_t block_bytes = ggml_type_size(GGML_TYPE_Q4_0);
++    const vk_q4_0_multiproj_push_constants pc = {
++        4096,
++        (uint32_t) cgraph->nodes[node_idx]->ne[0],
++        count,
++        (uint32_t) ((weights[0].offset - span_begin) / block_bytes),
++        (uint32_t) ((weights[1].offset - span_begin) / block_bytes),
++        count == 3 ? (uint32_t) ((weights[2].offset - span_begin) / block_bytes) : 0,
++    };
++
++    vk_pipeline pipeline = ctx->device->pipeline_q4_0_multiproj_navi22;
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++    ggml_vk_dispatch_pipeline(
++        ctx, subctx, pipeline,
++        {weight_span, q8_buf, outputs[0], outputs[1], outputs[2]},
++        pc, {(uint32_t) cgraph->nodes[node_idx]->ne[0], count, 1});
++
++    ctx->prealloc_y_need_sync = true;
++    ctx->q4_0_mmvq_navi22_dispatches += count;
++    ++ctx->q4_0_multiproj_groups;
++    ctx->q4_0_multiproj_logical_dispatches += count;
++    if (count == 3) {
++        ++ctx->q4_0_multiproj_qkv_groups;
++    } else {
++        ++ctx->q4_0_multiproj_ffn_groups;
++    }
++}
++
+ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+     ggml_tensor * dst = cgraph->nodes[node_idx];
+     const ggml_tensor * src0 = dst->src[0];
+@@ -9855,6 +10147,11 @@ static void ggml_vk_mul_mat(ggml_backend_vk_context * ctx, vk_context& subctx, c
+     ggml_tensor * src1 = dst->src[1];
+     VK_LOG_DEBUG("ggml_vk_mul_mat(" << src0 << ", " << src1 << ", " << dst << ")");
+ 
++    if (ctx->q4_0_multiproj_count != 0) {
++        ggml_vk_q4_0_multiproj(ctx, subctx, cgraph, node_idx);
++        return;
++    }
++
+     // Handle huge A matrix by splitting the M dimensions. This works well for convolution use cases
+     // where the M dimension is very large.
+     // Split_k doesn't work with M splitting.
+@@ -16818,18 +17115,6 @@ static uint32_t ggml_vk_fuse_multi_add(ggml_backend_vk_context * ctx, const stru
+     return num_adds;
+ }
+ 
+-static int32_t find_first_set(uint32_t x) {
+-    int32_t ret = 0;
+-    if (!x) {
+-        return -1;
+-    }
+-    while (!(x & 1)) {
+-        x >>= 1;
+-        ret++;
+-    }
+-    return ret;
+-}
+-
+ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
+     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+@@ -16930,6 +17215,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     ctx->rms_norm_mul_q8_1_partial_dispatches = 0;
+     ctx->rms_norm_mul_q8_1_direct_dispatches = 0;
+     ctx->q4_0_mmvq_navi22_dispatches = 0;
++    ctx->q4_0_multiproj_count = 0;
++    ctx->q4_0_multiproj_groups = 0;
++    ctx->q4_0_multiproj_qkv_groups = 0;
++    ctx->q4_0_multiproj_ffn_groups = 0;
++    ctx->q4_0_multiproj_logical_dispatches = 0;
+ 
+     // On weaker AMD GPUs larger submissions can hit a driver timeout, submit more often to avoid this
+     if (ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->shader_core_count > 0) {
+@@ -16960,10 +17250,18 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+ 
+         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+         ctx->fused_topk_moe_scale = false;
++        ctx->q4_0_multiproj_count = 0;
+         const char *fusion_string {};
+         if (!ctx->device->disable_fusion) {
++            const uint32_t multiproj_count = ggml_vk_q4_0_multiproj_eligible(ctx, cgraph, i);
+             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+-            if (num_adds) {
++            if (multiproj_count != 0) {
++                ctx->q4_0_multiproj_count = multiproj_count;
++                ctx->num_additional_fused_ops = multiproj_count - 1;
++                ctx->fused_ops_write_mask = (1u << multiproj_count) - 1;
++                fusion_string = multiproj_count == 3 ? "Q4_0_MULTIPROJ_QKV" : "Q4_0_MULTIPROJ_FFN";
++                std::fill_n(op_srcs_fused_elementwise, multiproj_count, false);
++            } else if (num_adds) {
+                 ctx->num_additional_fused_ops = num_adds - 1;
+                 fusion_string = "MULTI_ADD";
+                 std::fill_n(op_srcs_fused_elementwise, ctx->num_additional_fused_ops + 1, true);
+@@ -17102,15 +17400,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         // Check whether fusion would overwrite src operands while they're still in use.
+         // If so, disable fusion.
+         if (ctx->num_additional_fused_ops) {
+-            // There are up to two output nodes - topk_moe has two.
+-            uint32_t bits = ctx->fused_ops_write_mask & ~(1 << ctx->num_additional_fused_ops);
+-            ggml_tensor *output_nodes[2] {};
+-            output_nodes[0] = cgraph->nodes[i + ctx->num_additional_fused_ops];
+-            if (bits) {
+-                int output_idx = find_first_set(bits);
+-                GGML_ASSERT(bits == (1u << output_idx));
+-                output_nodes[1] = cgraph->nodes[i + output_idx];
++            std::array<ggml_tensor *, 12> output_nodes {};
++            uint32_t output_node_count = 0;
++            for (int output_idx = 0; output_idx <= ctx->num_additional_fused_ops; ++output_idx) {
++                if (ctx->fused_ops_write_mask & (1u << output_idx)) {
++                    output_nodes[output_node_count++] = cgraph->nodes[i + output_idx];
++                }
+             }
++            GGML_ASSERT(output_node_count > 0 && output_node_count <= output_nodes.size());
+ 
+             bool need_disable = false;
+ 
+@@ -17121,11 +17418,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                                           ggml_nrows(cgraph->nodes[i]->src[0]) == 1;
+ 
+             if (!is_topk_moe_single_row) {
+-                for (int j = 0; j < 2; ++j) {
+-                    ggml_tensor *dst = output_nodes[j];
+-                    if (!dst) {
+-                        continue;
+-                    }
++                for (uint32_t output_idx = 0; output_idx < output_node_count; ++output_idx) {
++                    ggml_tensor * dst = output_nodes[output_idx];
+                     // Loop over all srcs of all nodes in the fusion. If the src overlaps
+                     // the destination and the src is not an intermediate node that's being
+                     // elided, then disable fusion.
+@@ -17156,6 +17450,15 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 ctx->fused_ops_write_mask = 1;
+                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+                 ctx->fused_topk_moe_scale = false;
++                ctx->q4_0_multiproj_count = 0;
++            }
++        }
++
++        if (ctx->q4_0_multiproj_count != 0) {
++            for (uint32_t fused_idx = 1; fused_idx < ctx->q4_0_multiproj_count; ++fused_idx) {
++                const uint64_t node_flops = ggml_vk_get_node_flops(cgraph->nodes[i + fused_idx]);
++                batch_flops += node_flops;
++                total_flops += node_flops;
+             }
+         }
+ 
+@@ -17205,6 +17508,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         i += ctx->num_additional_fused_ops;
+         ctx->num_additional_fused_ops = 0;
+         ctx->fused_ops_write_mask = 0;
++        ctx->q4_0_multiproj_count = 0;
+     }
+ 
+     ctx->last_total_flops = total_flops;
+@@ -17251,6 +17555,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+             ctx->q4_0_mmvq_navi22_dispatches);
+     }
+ 
++    if (ctx->device->q4_0_multiproj_navi22 &&
++        ctx->q4_0_multiproj_groups != 0 &&
++        !ctx->device->q4_0_multiproj_navi22_diagnostic_logged.exchange(true)) {
++        fprintf(
++            stderr,
++            "ggml_vulkan: Q4_0 Navi22 multi-projection coverage "
++            "(wave64 rows_per_workgroup=2 groups=%u qkv_groups=%u ffn_groups=%u logical_dispatches=%u)\n",
++            ctx->q4_0_multiproj_groups,
++            ctx->q4_0_multiproj_qkv_groups,
++            ctx->q4_0_multiproj_ffn_groups,
++            ctx->q4_0_multiproj_logical_dispatches);
++    }
++
+     if (vk_perf_logger_enabled) {
+         // End the command buffer and submit/wait
+         GGML_ASSERT(!ctx->compute_ctx.expired());
+@@ -17385,6 +17702,64 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph *
+             continue;
+         }
+ 
++        if (ctx->device->q4_0_multiproj_navi22) {
++            ggml_tensor * first = graph->nodes[first_unused];
++            const uint32_t expected = ggml_vk_q4_0_multiproj_expected_count(first);
++            if (expected != 0) {
++                std::array<int, 3> projection_nodes {};
++                uint32_t projection_count = 1;
++                projection_nodes[0] = first_unused;
++                const int multiproj_lookahead = 20;
++                for (int j = first_unused + 1;
++                     projection_count < expected &&
++                     j < std::min(first_unused + multiproj_lookahead, graph->n_nodes);
++                     ++j) {
++                    if (!used[j] && ggml_vk_q4_0_multiproj_matches(first, graph->nodes[j])) {
++                        bool ready = true;
++                        for (int c = first_unused; c < j; ++c) {
++                            if (!used[c] && is_src_of(graph->nodes[j], graph->nodes[c])) {
++                                ready = false;
++                                break;
++                            }
++                        }
++                        if (ready) {
++                            projection_nodes[projection_count++] = j;
++                        }
++                    }
++                }
++
++                bool distinct_weights = projection_count == expected;
++                for (uint32_t j = 0; distinct_weights && j < projection_count; ++j) {
++                    for (uint32_t k = j + 1; k < projection_count; ++k) {
++                        if (graph->nodes[projection_nodes[j]]->src[0] == graph->nodes[projection_nodes[k]]->src[0]) {
++                            distinct_weights = false;
++                            break;
++                        }
++                    }
++                }
++                uint32_t graph_matches = 0;
++                if (distinct_weights) {
++                    for (int j = 0; j < graph->n_nodes; ++j) {
++                        if (graph->nodes[j] == first || ggml_vk_q4_0_multiproj_matches(first, graph->nodes[j])) {
++                            ++graph_matches;
++                        }
++                    }
++                }
++                if (distinct_weights && graph_matches == expected) {
++                    for (uint32_t j = 0; j < projection_count; ++j) {
++                        const int projection_idx = projection_nodes[j];
++                        new_order.push_back(graph->nodes[projection_idx]);
++                        used_node_set.insert(graph->nodes[projection_idx]);
++                        used[projection_idx] = true;
++                    }
++                    while (first_unused < graph->n_nodes && used[first_unused]) {
++                        ++first_unused;
++                    }
++                    continue;
++                }
++            }
++        }
++
+         // First, grab the next unused node.
+         current_set.push_back(first_unused);
+ 
+@@ -17402,6 +17777,12 @@ static void ggml_vk_graph_optimize(ggml_backend_t backend, struct ggml_cgraph *
+             if (is_empty(graph->nodes[j])) {
+                 continue;
+             }
++            // Leave projection candidates for the strict grouping pass when
++            // their first node becomes first_unused.
++            if (ctx->device->q4_0_multiproj_navi22 &&
++                ggml_vk_q4_0_multiproj_expected_count(graph->nodes[j]) != 0) {
++                continue;
++            }
+             // Don't pull forward nodes from fusion patterns
+             if (match_pattern(topk_moe_early_softmax_norm, j) ||
+                 match_pattern(topk_moe_sigmoid_norm_bias, j) ||
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_0_multiproj_navi22.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_0_multiproj_navi22.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..3dc1b37d16a2ea07d4ce4c80535ffed9397817a6
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_0_multiproj_navi22.comp
+@@ -0,0 +1,136 @@
++#version 450
++
++#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
++#extension GL_EXT_integer_dot_product : require
++#extension GL_EXT_control_flow_attributes : enable
++#extension GL_KHR_shader_subgroup_basic : require
++#extension GL_KHR_shader_subgroup_arithmetic : require
++
++#define MMQ
++#define B_TYPE block_q8_1_x4
++
++#include "types.glsl"
++
++layout (binding = 0) readonly buffer A { A_TYPE data_a[]; };
++layout (binding = 0) readonly buffer A_PACKED16 { A_TYPE_PACKED16 data_a_packed16[]; };
++layout (binding = 1) readonly buffer B { B_TYPE data_b[]; };
++layout (binding = 2) writeonly buffer D0 { float data_d0[]; };
++layout (binding = 3) writeonly buffer D1 { float data_d1[]; };
++layout (binding = 4) writeonly buffer D2 { float data_d2[]; };
++
++layout (push_constant) uniform parameter {
++    uint ncols;
++    uint nrows;
++    uint projection_count;
++    uint a_block_offset0;
++    uint a_block_offset1;
++    uint a_block_offset2;
++} p;
++
++layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
++
++#define K_PER_ITER 8
++#define BLOCK_SIZE 64
++#define NUM_ROWS 2
++
++int32_t cache_b_qs[K_PER_ITER / 4];
++vec2 cache_b_ds;
++
++#include "mul_mat_vecq_funcs.glsl"
++
++uint projection_a_block_offset(const uint projection) {
++    if (projection == 0) {
++        return p.a_block_offset0;
++    }
++    if (projection == 1) {
++        return p.a_block_offset1;
++    }
++    return p.a_block_offset2;
++}
++
++void store_output(const uint projection, const uint row, const float value) {
++    if (projection == 0) {
++        data_d0[row] = value;
++    } else if (projection == 1) {
++        data_d1[row] = value;
++    } else {
++        data_d2[row] = value;
++    }
++}
++
++void iter(
++        inout float temp[NUM_ROWS],
++        const uint a_block_offset,
++        const uint first_row,
++        const uint num_rows,
++        const uint col,
++        const uint b_qs_idx) {
++    const uint b_block_idx = col / QUANT_K_Q8_1;
++    const uint b_block_idx_outer = b_block_idx / 4;
++    const uint b_block_idx_inner = b_block_idx % 4;
++    cache_b_ds = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
++    cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx];
++    cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx + 4];
++
++    uint ibi = first_row * p.ncols;
++    [[unroll]] for (uint row = 0; row < num_rows; ++row) {
++        const uint a_block_idx = (ibi + col) / QUANT_K_Q8_1 + a_block_offset;
++        ibi += p.ncols;
++        temp[row] += mmvq_dot_product(a_block_idx, b_qs_idx);
++    }
++}
++
++void main() {
++    const uint projection = gl_WorkGroupID.y;
++    if (projection >= p.projection_count) {
++        return;
++    }
++
++    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
++    if (first_row >= p.nrows) {
++        return;
++    }
++    const uint num_rows = min(uint(NUM_ROWS), p.nrows - first_row);
++    const uint tid = gl_LocalInvocationID.x;
++    const uint a_block_offset = projection_a_block_offset(projection);
++
++    float temp[NUM_ROWS];
++    [[unroll]] for (uint row = 0; row < num_rows; ++row) {
++        temp[row] = 0.0f;
++    }
++
++    const uint col_stride = K_PER_ITER * BLOCK_SIZE;
++    uint num_iters = p.ncols / col_stride;
++    if (num_iters * col_stride + K_PER_ITER * tid < p.ncols) {
++        num_iters++;
++    }
++
++    const uint b_qs_idx = tid % (32 / K_PER_ITER);
++    uint col = tid * K_PER_ITER;
++    while (num_iters >= 4) {
++        [[unroll]] for (uint k = 0; k < 4; ++k) {
++            iter(temp, a_block_offset, first_row, num_rows, col, b_qs_idx);
++            col += col_stride;
++        }
++        num_iters -= 4;
++    }
++    if (num_iters >= 2) {
++        iter(temp, a_block_offset, first_row, num_rows, col, b_qs_idx);
++        col += col_stride;
++        iter(temp, a_block_offset, first_row, num_rows, col, b_qs_idx);
++        col += col_stride;
++        num_iters -= 2;
++    }
++    if (num_iters > 0) {
++        iter(temp, a_block_offset, first_row, num_rows, col, b_qs_idx);
++    }
++
++    [[unroll]] for (uint row = 0; row < num_rows; ++row) {
++        temp[row] = subgroupAdd(temp[row]);
++    }
++    if (gl_SubgroupInvocationID == 0) {
++        [[unroll]] for (uint row = 0; row < num_rows; ++row) {
++            store_output(projection, first_row + row, temp[row]);
++        }
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index df9c2bc6868320755a62f5e4fea099f5b18c7bb0..23ceeffdcd08b0567e4dc96afee7d4f10223292a 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -728,6 +728,13 @@ void process_shaders() {
+ 
+     std::map<std::string, std::string> base_dict = {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}};
+ 
++#if defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
++    string_to_spv(
++        "mul_mat_vec_q4_0_q8_1_f32_multiproj_navi22",
++        "mul_mat_vec_q4_0_multiproj_navi22.comp",
++        merge_maps(base_dict, {{"DATA_A_Q4_0", "1"}}));
++#endif
++
+     for (const auto& tname : type_names) {
+         // mul mat vec
+         std::string data_a_key = "DATA_A_" + to_uppercase(tname);
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 7694ca3245dde0be728dc1e31a09314060bee552..ba7cf4b09ddf4d572c71dda12c23a21e47b8eb3c 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3615,7 +3615,7 @@ struct test_rms_norm_mul_q4_0_mul_mat : public test_case {
+           eps(eps) {
+         GGML_ASSERT(k > 0 && k % ggml_blck_size(GGML_TYPE_Q4_0) == 0);
+         GGML_ASSERT(output_rows > 0 && n > 0);
+-        GGML_ASSERT(consumers == 1 || consumers == 2);
++        GGML_ASSERT(consumers >= 1 && consumers <= 3);
+     }
+ 
+     std::string op_desc(ggml_tensor * t) override {
+@@ -3688,6 +3688,10 @@ struct test_rms_norm_mul_q4_0_mul_mat : public test_case {
+             ggml_format_name(weight, "weight_%u", i);
+             ggml_tensor * consumer = ggml_mul_mat(ctx, weight, activation);
+             ggml_format_name(consumer, "consumer_%u", i);
++            if (consumers > 1) {
++                consumer = ggml_scale(ctx, consumer, (float) (i + 1));
++                ggml_format_name(consumer, "consumer_scaled_%u", i);
++            }
+             out = out == nullptr ? consumer : ggml_add(ctx, out, consumer);
+         }
+         ggml_set_name(out, "out");
+@@ -8830,6 +8834,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(14336, 33));
+     test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 4096, 1, true));
+     test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 33, 1, false, 2));
++    test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 4096, 1, false, 2));
++    test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 4096, 1, false, 3));
++    test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 11008, 1, false, 2));
++    test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 11008, 1, false, 3));
++    test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 4096, 2, false, 3));
+     test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 33, 2));
+     test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4160, 33));
+ 

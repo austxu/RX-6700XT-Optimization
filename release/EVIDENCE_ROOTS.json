@@ -1,0 +1,47 @@
+{
+  "roots": [
+    {
+      "label": "current-master-llama2-correctness-fail",
+      "source_file_count": 197,
+      "source_root": "${REPO}/artifacts/public-release/current-master/correctness/llama2-20260724T065633Z",
+      "source_root_seal_sha256": "78dac576e71305ee1810772cd0e9c499769a24178d23df545121d055157d24c2"
+    },
+    {
+      "label": "nine-patch-campaign",
+      "source_file_count": 282,
+      "source_root": "${REPO}/artifacts/public-release/phase5/llama2-attention-abba-20260717T224044Z",
+      "source_root_seal_sha256": "645ce196c11efe0d730f2d19490e23cca674f93cd84311de3aa94462ac29e495"
+    },
+    {
+      "label": "nine-patch-correctness",
+      "source_file_count": 44,
+      "source_root": "${REPO}/artifacts/public-release/release/final-correctness-20260718T004000Z",
+      "source_root_seal_sha256": "c3e4e52c67c8524b6af9db02cf2375e775424d7a519867f79f086fe7527e41a9"
+    },
+    {
+      "label": "nine-patch-preflight",
+      "source_file_count": 24,
+      "source_root": "${REPO}/artifacts/public-release/phase5/llama2-attention-abba-preflight-20260717T224000Z",
+      "source_root_seal_sha256": "7260f66c72f712a55d092c5f50227a70b3cf3a4c6fb233a038271a09b93ad985"
+    },
+    {
+      "label": "retained-campaign",
+      "source_file_count": 277,
+      "source_root": "${REPO}/artifacts/public-release/phase6/llama2-retained-a551-abba-20260721T025858Z",
+      "source_root_seal_sha256": "ba78604dd1d73a44f4f9bbb7afe14e91b23f0e5740d2f15f4ad0d1269427633d"
+    },
+    {
+      "label": "retained-correctness",
+      "source_file_count": 82,
+      "source_root": "${REPO}/artifacts/public-release/phase6/q4-down-prefetch-correctness-20260720T062412Z",
+      "source_root_seal_sha256": "ad8779feea6ac21c9fc63343b6133d75d3bc8accee76e9db0577ad318825eac6"
+    },
+    {
+      "label": "retained-preflight",
+      "source_file_count": 19,
+      "source_root": "${REPO}/artifacts/public-release/phase6/llama2-retained-a551-abba-preflight-20260721T025813Z",
+      "source_root_seal_sha256": "fb13f54aa10bbe2be18152703f681db1c0c95169038af5d6001a0819549dc0c5"
+    }
+  ],
+  "schema": "amd-inference-evidence-root-contract-v1"
+}

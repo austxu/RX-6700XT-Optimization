@@ -1,0 +1,2665 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: austxu <austxu@users.noreply.github.com>
+Date: Tue, 21 Jul 2026 09:12:01 -0700
+Subject: [PATCH] vulkan: retain validated Navi22 Llama 2 paths
+
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp          | 869 +++++++++++++++++-
+ .../vulkan-shaders/flash_attn.comp            |  34 +-
+ .../vulkan-shaders/flash_attn_base.glsl       |   1 +
+ .../flash_attn_decode_f16_navi22.comp         | 292 ++++++
+ ...sh_attn_split_k_reduce_q8_1_x4_navi22.comp |   2 +-
+ ...mul_mat_vec_f16_attn_av_rows16_navi22.comp |  51 +
+ ...ec_f16_attn_av_rows32_dualwave_navi22.comp |  60 ++
+ .../mul_mat_vec_f16_attn_av_rows8_navi22.comp |  58 ++
+ ...ec_f16_attn_qk_rows16_dualwave_navi22.comp |  92 ++
+ .../vulkan-shaders/mul_mat_vec_nc.comp        |  16 +-
+ .../mul_mat_vec_q4_0_multiproj_navi22.comp    | 189 +++-
+ .../vulkan-shaders/mul_mat_vecq.comp          | 148 ++-
+ .../rope_qkv_set_rows_navi22.comp             |  67 ++
+ .../vulkan-shaders/vulkan-shaders-gen.cpp     |  52 +-
+ tests/test-backend-ops.cpp                    |   7 +
+ 15 files changed, 1894 insertions(+), 44 deletions(-)
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_decode_f16_navi22.comp
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_av_rows16_navi22.comp
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_av_rows32_dualwave_navi22.comp
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_av_rows8_navi22.comp
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_qk_rows16_dualwave_navi22.comp
+ create mode 100644 ggml/src/ggml-vulkan/vulkan-shaders/rope_qkv_set_rows_navi22.comp
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 98033bbec..572106bd6 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -678,6 +678,11 @@ static constexpr std::initializer_list<std::array<int, 3>> rope_view_set_rows_ed
+     { 2, 0, 1 }, // set_rows->src[0] == view
+ };
+ 
++static constexpr std::initializer_list<std::array<int, 3>> post_qkv_navi22_edges {
++    { 2, 0, 1 }, // K view->src[0]     == K rope
++    { 3, 0, 2 }, // K set_rows->src[0] == K view
++};
++
+ static constexpr std::initializer_list<std::array<int, 3>> rms_norm_mul_rope_view_set_rows_edges {
+     { 1, 0, 0 }, // mul->src[0]      == rms
+     { 2, 0, 1 }, // rope->src[0]     == mul
+@@ -748,8 +753,19 @@ struct vk_device_struct {
+     bool q4_k_mmvq_navi22 {};
+     std::atomic<bool> q4_k_mmvq_navi22_banner_logged {};
+     bool q4_0_mmvq_navi22 {};
++    uint32_t q4_0_mmvq_navi22_rows1_mode {};
++    bool q4_0_down_prefetch_navi22 {};
+     std::atomic<bool> q4_0_mmvq_navi22_banner_logged {};
++    std::atomic<bool> q4_0_mmvq_navi22_rows1_banner_logged {};
++    std::atomic<bool> q4_0_down_prefetch_navi22_banner_logged {};
+     std::atomic<bool> q4_0_mmvq_navi22_diagnostic_logged {};
++    uint32_t f16_attn_navi22_mode {};
++    std::atomic<bool> f16_attn_p021_navi22_banner_logged {};
++    std::atomic<bool> f16_attn_nc_navi22_banner_logged {};
++    std::atomic<bool> f16_attn_navi22_diagnostic_logged {};
++    uint32_t f16_attn_mmv_navi22_rows {};
++    std::atomic<bool> f16_attn_mmv_navi22_banner_logged {};
++    std::atomic<bool> f16_attn_mmv_navi22_diagnostic_logged {};
+     bool q4_0_multiproj_navi22 {};
+     std::atomic<bool> q4_0_multiproj_navi22_banner_logged {};
+     std::atomic<bool> q4_0_multiproj_navi22_diagnostic_logged {};
+@@ -757,6 +773,11 @@ struct vk_device_struct {
+     std::atomic<bool> rms_norm_mul_q8_1_navi22_diagnostic_logged {};
+     bool flash_attn_q8_1_navi22 {};
+     std::atomic<bool> flash_attn_q8_1_navi22_diagnostic_logged {};
++    bool fa_masked_split_navi22 {};
++    std::atomic<bool> fa_masked_split_navi22_diagnostic_logged {};
++    bool post_qkv_fusion_navi22 {};
++    std::atomic<bool> post_qkv_fusion_navi22_banner_logged {};
++    std::atomic<bool> post_qkv_fusion_navi22_diagnostic_logged {};
+ 
+     bool subgroup_size_control;
+     uint32_t subgroup_min_size;
+@@ -840,10 +861,22 @@ struct vk_device_struct {
+ 
+     vk_pipeline pipeline_dequant_mul_mat_vec_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT][mul_mat_vec_max_cols];
+     vk_pipeline pipeline_dequant_mul_mat_vec_id_q8_1_f32[DMMV_WG_SIZE_COUNT][GGML_TYPE_COUNT];
++    vk_pipeline pipeline_q4_0_mmvq_rows1_navi22;
++    vk_pipeline pipeline_q4_0_mmvq_rows1_k11008_navi22;
++    vk_pipeline pipeline_q4_0_mmvq_rows1_k11008_prefetch_navi22;
++    vk_pipeline pipeline_q4_0_mmvq_rows2_k4096_navi22;
++    vk_pipeline pipeline_f16_attn_mmv_rows1_navi22;
++    vk_pipeline pipeline_f16_attn_mmv_rows4_navi22;
++    vk_pipeline pipeline_f16_attn_mmv_rows8_navi22;
++    vk_pipeline pipeline_f16_attn_mmv_rows16_navi22;
+     vk_pipeline pipeline_q4_0_multiproj_navi22;
++    vk_pipeline pipeline_q4_0_multiproj_qkv_rows1_navi22;
++    vk_pipeline pipeline_q4_0_multiproj_ffn_swiglu_navi22;
+ 
+     vk_pipeline pipeline_mul_mat_vec_p021_f16_f32[p021_max_gqa_ratio];
+     vk_pipeline pipeline_mul_mat_vec_nc_f16_f32;
++    vk_pipeline pipeline_mul_mat_vec_p021_f16_f32_wave32_navi22;
++    vk_pipeline pipeline_mul_mat_vec_nc_f16_f32_subgroup_navi22;
+     vk_pipeline pipeline_get_rows[GGML_TYPE_COUNT];
+     vk_pipeline pipeline_get_rows_f32[GGML_TYPE_COUNT];
+     vk_pipeline pipeline_get_rows_back_f32;
+@@ -959,6 +992,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_rope_neox_f32, pipeline_rope_neox_f16, pipeline_rope_neox_f32_f16;
+     vk_pipeline pipeline_rope_multi_f32, pipeline_rope_multi_f16, pipeline_rope_multi_f32_f16;
+     vk_pipeline pipeline_rope_vision_f32, pipeline_rope_vision_f16;
++    vk_pipeline pipeline_rope_qkv_set_rows_navi22;
+     vk_pipeline pipeline_argsort_f32[num_argsort_pipelines];
+     vk_pipeline pipeline_argsort_large_f32[num_argsort_pipelines];
+     vk_pipeline pipeline_topk_f32[num_topk_pipelines];
+@@ -1009,6 +1043,7 @@ struct vk_device_struct {
+ 
+     vk_pipeline pipeline_flash_attn_split_k_reduce;
+     vk_pipeline pipeline_flash_attn_split_k_reduce_q8_1_x4_navi22;
++    vk_pipeline pipeline_flash_attn_masked_split_q8_1_x4_navi22;
+     vk_pipeline pipeline_count_experts;
+ 
+     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
+@@ -1540,6 +1575,23 @@ struct vk_op_rope_push_constants {
+ };
+ static_assert(sizeof(vk_op_rope_push_constants) <= 128, "sizeof(vk_op_rope_push_constants) must be <= 128");
+ 
++struct vk_op_rope_qkv_set_rows_navi22_push_constants {
++    float theta_scale;
++    uint32_t k_row_stride;
++    uint32_t v_row_stride;
++    uint32_t q_src_offset;
++    uint32_t k_src_offset;
++    uint32_t v_src_offset;
++    uint32_t pos_offset;
++    uint32_t q_dst_offset;
++    uint32_t k_dst_offset;
++    uint32_t v_dst_offset;
++    uint32_t k_index_offset;
++    uint32_t v_index_offset;
++    uint32_t v_scalar_rows;
++};
++static_assert(sizeof(vk_op_rope_qkv_set_rows_navi22_push_constants) <= 128);
++
+ // For fused rms_norm+mul+rope(+view+set_rows)
+ struct vk_op_rms_norm_mul_rope_push_constants {
+     vk_op_binary_push_constants bin;
+@@ -2235,14 +2287,27 @@ struct ggml_backend_vk_context {
+     uint32_t flash_attn_q8_1_exact_shape {};
+     uint32_t flash_attn_q8_1_route {};
+     uint32_t flash_attn_q8_1_split2 {};
++    uint32_t flash_attn_q8_1_masked_split_direct {};
+     uint32_t flash_attn_q8_1_produced {};
+     uint32_t flash_attn_q8_1_consumer_cache_hits {};
+     uint32_t q4_0_mmvq_navi22_dispatches {};
++    uint32_t q4_0_mmvq_navi22_rows1_dispatches {};
++    uint32_t q4_0_mmvq_navi22_rows1_down_dispatches {};
++    uint32_t q4_0_mmvq_navi22_rows1_attention_dispatches {};
++    uint32_t q4_0_down_prefetch_navi22_dispatches {};
++    uint32_t f16_attn_p021_navi22_dispatches {};
++    uint32_t f16_attn_nc_navi22_dispatches {};
++    uint32_t f16_attn_mmv_navi22_dispatches {};
++    uint32_t f16_attn_mmv_navi22_qk_dispatches {};
++    uint32_t f16_attn_mmv_navi22_av_dispatches {};
++    uint32_t post_qkv_fusion_navi22_dispatches {};
+     uint32_t q4_0_multiproj_count {};
+     uint32_t q4_0_multiproj_groups {};
+     uint32_t q4_0_multiproj_qkv_groups {};
+     uint32_t q4_0_multiproj_ffn_groups {};
++    uint32_t q4_0_multiproj_ffn_swiglu_groups {};
+     uint32_t q4_0_multiproj_logical_dispatches {};
++    bool q4_0_multiproj_ffn_swiglu {};
+     topk_moe_mode fused_topk_moe_mode {};
+     bool fused_topk_moe_scale {};
+ 
+@@ -3678,14 +3743,16 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
+ }
+ 
+ static vk_fa_pipeline_state get_fa_pipeline_state(const vk_device& device, const vk_fa_tuning_params& params, uint32_t hsk, uint32_t hsv, bool aligned, bool f32acc,
+-                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, ggml_type k_type, ggml_type v_type) {
++                                                  bool use_mask, bool use_mask_opt, bool use_logit_softcap, bool cull_mask_neg_inf,
++                                                  ggml_type k_type, ggml_type v_type) {
+     const bool old_amd_windows = device->vendor_id == VK_VENDOR_ID_AMD && device->driver_id == vk::DriverId::eAmdProprietary &&
+                                  (device->architecture == AMD_GCN || device->architecture == AMD_RDNA1 || device->architecture == AMD_RDNA2);
+ 
+     uint32_t flags = (use_mask_opt      ? 1 : 0) |
+                      (use_mask          ? 2 : 0) |
+                      (use_logit_softcap ? 4 : 0) |
+-                     (old_amd_windows   ? 8 : 0);
++                     (old_amd_windows   ? 8 : 0) |
++                     (cull_mask_neg_inf ? 16 : 0);
+ 
+     const uint32_t subgroup_size = params.disable_subgroups ? 0 : params.subgroup_size;
+ 
+@@ -4988,6 +5055,22 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             mul_mat_vec_q4_0_q8_1_f32_multiproj_navi22_data,
+             "main", 5, sizeof(vk_q4_0_multiproj_push_constants), {2, 1, 1}, {}, 1,
+             true, true, 64);
++        ggml_vk_create_pipeline(
++            device,
++            device->pipeline_q4_0_multiproj_qkv_rows1_navi22,
++            "mul_mat_vec_q4_0_q8_1_f32_multiproj_qkv_rows1_navi22",
++            mul_mat_vec_q4_0_q8_1_f32_multiproj_qkv_rows1_navi22_len,
++            mul_mat_vec_q4_0_q8_1_f32_multiproj_qkv_rows1_navi22_data,
++            "main", 5, sizeof(vk_q4_0_multiproj_push_constants), {1, 1, 1}, {}, 1,
++            true, true, 64);
++        ggml_vk_create_pipeline(
++            device,
++            device->pipeline_q4_0_multiproj_ffn_swiglu_navi22,
++            "mul_mat_vec_q4_0_q8_1_f32_multiproj_ffn_swiglu_navi22",
++            mul_mat_vec_q4_0_q8_1_f32_multiproj_ffn_swiglu_navi22_len,
++            mul_mat_vec_q4_0_q8_1_f32_multiproj_ffn_swiglu_navi22_data,
++            "main", 5, sizeof(vk_q4_0_multiproj_push_constants), {1, 1, 1}, {}, 1,
++            true, true, 64);
+     }
+ #endif
+ 
+@@ -5014,6 +5097,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         for (uint32_t i = 0; i < mul_mat_vec_max_cols; ++i) {
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F32 ][i], "mul_mat_vec_f32_f32_f32",  arr_dmmv_f32_f32_f32_len[reduc],  arr_dmmv_f32_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {wg_size_subgroup, 1, i+1}, 1, false, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_F16 ][i], "mul_mat_vec_f16_f32_f32",  arr_dmmv_f16_f32_f32_len[reduc],  arr_dmmv_f16_f32_f32_data[reduc],  "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
++            if (device->f16_attn_mmv_navi22_rows != 0 && w == DMMV_WG_SIZE_SUBGROUP && i == 0) {
++                ggml_vk_create_pipeline(device, device->pipeline_f16_attn_mmv_rows1_navi22, "mul_mat_vec_f16_f32_f32_navi22_attn_rows1", arr_dmmv_f16_f32_f32_len[reduc], arr_dmmv_f16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {32, 1, 1}, 1, false, true, 32);
++                ggml_vk_create_pipeline(device, device->pipeline_f16_attn_mmv_rows4_navi22, "mul_mat_vec_f16_f32_f32_navi22_attn_rows4", arr_dmmv_f16_f32_f32_len[reduc], arr_dmmv_f16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {4, 1, 1}, {32, 4, 1}, 1, false, true, 32);
++                ggml_vk_create_pipeline(device, device->pipeline_f16_attn_mmv_rows8_navi22, "mul_mat_vec_f16_f32_f32_navi22_attn_rows8_dualwave", mul_mat_vec_f16_attn_qk_rows16_dualwave_navi22_len, mul_mat_vec_f16_attn_qk_rows16_dualwave_navi22_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {16, 1, 1}, {}, 1, false, true, 32);
++                ggml_vk_create_pipeline(device, device->pipeline_f16_attn_mmv_rows16_navi22, "mul_mat_vec_f16_f32_f32_navi22_attn_rows16", arr_dmmv_f16_f32_f32_len[reduc], arr_dmmv_f16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {16, 1, 1}, {32, 16, 1}, 1, false, true, 32);
++            }
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_BF16][i], "mul_mat_vec_bf16_f32_f32", arr_dmmv_bf16_f32_f32_len[reduc], arr_dmmv_bf16_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {wg_size_subgroup, 2, i+1}, 1, false, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q1_0][i], "mul_mat_vec_q1_0_f32_f32", arr_dmmv_q1_0_f32_f32_len[reduc], arr_dmmv_q1_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_f32_f32", arr_dmmv_q2_0_f32_f32_len[reduc], arr_dmmv_q2_0_f32_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_stdq, 1, 1}, {wg_size_subgroup, 2*rm_stdq, i+1}, 1, true, use_subgroups, force_subgroup_size);
+@@ -5074,6 +5163,12 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q2_0][i], "mul_mat_vec_q2_0_q8_1_f32", arr_dmmv_q2_0_q8_1_f32_len[reduc], arr_dmmv_q2_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2*rm_kq_int, 1, 1}, {wg_size_subgroup_int, 2*rm_kq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 if (device->q4_0_mmvq_navi22 && w == DMMV_WG_SIZE_SUBGROUP && i == 0) {
+                     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_q8_1_f32_navi22_rows2", arr_dmmv_q4_0_q8_1_f32_len[reduc], arr_dmmv_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {64, 2, 1}, 1, true, true, 64);
++                    ggml_vk_create_pipeline(device, device->pipeline_q4_0_mmvq_rows1_navi22, "mul_mat_vec_q4_0_q8_1_f32_navi22_rows1_shape", arr_dmmv_q4_0_q8_1_f32_len[reduc], arr_dmmv_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {64, 1, 1}, 1, true, true, 64);
++                    ggml_vk_create_pipeline(device, device->pipeline_q4_0_mmvq_rows1_k11008_navi22, "mul_mat_vec_q4_0_q8_1_f32_navi22_rows1_shape", mul_mat_vec_q4_0_q8_1_f32_navi22_k11008_len, mul_mat_vec_q4_0_q8_1_f32_navi22_k11008_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {64, 1, 1}, 1, true, true, 64);
++                    if (device->q4_0_down_prefetch_navi22) {
++                        ggml_vk_create_pipeline(device, device->pipeline_q4_0_mmvq_rows1_k11008_prefetch_navi22, "mul_mat_vec_q4_0_q8_1_f32_navi22_down_prefetch", mul_mat_vec_q4_0_q8_1_f32_navi22_k11008_prefetch_len, mul_mat_vec_q4_0_q8_1_f32_navi22_k11008_prefetch_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {64, 1, 1}, 1, true, true, 64);
++                    }
++                    ggml_vk_create_pipeline(device, device->pipeline_q4_0_mmvq_rows2_k4096_navi22, "mul_mat_vec_q4_0_q8_1_f32_navi22_rows2", mul_mat_vec_q4_0_q8_1_f32_navi22_k4096_len, mul_mat_vec_q4_0_q8_1_f32_navi22_k4096_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {2, 1, 1}, {64, 2, 1}, 1, true, true, 64);
+                 } else {
+                     ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_q8_1_f32[w][GGML_TYPE_Q4_0][i], "mul_mat_vec_q4_0_q8_1_f32", arr_dmmv_q4_0_q8_1_f32_len[reduc], arr_dmmv_q4_0_q8_1_f32_data[reduc], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1*rm_stdq_int, 1, 1}, {wg_size_subgroup_int, 1*rm_stdq_int, i+1}, 1, true, use_subgroups, subgroup_size_int);
+                 }
+@@ -5256,6 +5351,14 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+                                 "main", 4, sizeof(vk_op_flash_attn_split_k_reduce_push_constants),
+                                 {1, 128, 1}, {}, 1, true, true, 32);
+     }
++    if (device->fa_masked_split_navi22) {
++        ggml_vk_create_pipeline(device, device->pipeline_flash_attn_masked_split_q8_1_x4_navi22,
++                                "fa_masked_split_q8_1_x4_navi22",
++                                fa_masked_split_q8_1_x4_navi22_len,
++                                fa_masked_split_q8_1_x4_navi22_data,
++                                "main", 6, sizeof(vk_flash_attn_push_constants),
++                                {1, 1, 1}, {}, 1, true, true, 32);
++    }
+ 
+     for (auto &it : device->pipeline_fa_mask_opt) {
+         auto BrBc = it.first;
+@@ -5276,6 +5379,22 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+         }
+     }
+     ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32, "mul_mat_vec_nc_f16_f32", mul_mat_vec_nc_f16_f32_len, mul_mat_vec_nc_f16_f32_data, "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants), {1, 1, 1}, {}, 1);
++    if ((device->f16_attn_navi22_mode & 2u) != 0) {
++        ggml_vk_create_pipeline2(device, device->pipeline_mul_mat_vec_p021_f16_f32_wave32_navi22,
++                                "mul_mat_vec_p021_f16_f32_wave32_navi22",
++                                mul_mat_vec_f16_attn_av_rows32_dualwave_navi22_len,
++                                mul_mat_vec_f16_attn_av_rows32_dualwave_navi22_data,
++                                "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_p021_push_constants),
++                                {1, 32, 1}, {}, 1, true, true, 32);
++    }
++    if ((device->f16_attn_navi22_mode & 1u) != 0) {
++        ggml_vk_create_pipeline(device, device->pipeline_mul_mat_vec_nc_f16_f32_subgroup_navi22,
++                                "mul_mat_vec_nc_f16_f32_subgroup_navi22",
++                                mul_mat_vec_nc_f16_f32_subgroup_add_navi22_len,
++                                mul_mat_vec_nc_f16_f32_subgroup_add_navi22_data,
++                                "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_nc_push_constants),
++                                {1, 1, 1}, {}, 1, true, true, 32);
++    }
+ 
+     ggml_vk_create_pipeline(device, device->pipeline_norm_f32, "norm_f32", norm_f32_len, norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_group_norm_f32, "group_norm_f32", group_norm_f32_len, group_norm_f32_data, "main", 2, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
+@@ -5520,6 +5639,21 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     ggml_vk_create_pipeline(device, device->pipeline_rope_neox_f32_f16, "rope_neox_f32_f16", rope_neox_f32_f16_len, rope_neox_f32_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
+     ggml_vk_create_pipeline(device, device->pipeline_rope_multi_f32_f16, "rope_multi_f32_f16", rope_multi_f32_f16_len, rope_multi_f32_f16_data, "main", 5, sizeof(vk_op_rope_push_constants), {1, 512, 1}, {}, 1);
+ 
++    if (device->post_qkv_fusion_navi22) {
++        ggml_vk_create_pipeline(
++            device,
++            device->pipeline_rope_qkv_set_rows_navi22,
++            "rope_qkv_set_rows_navi22",
++            rope_qkv_set_rows_navi22_len,
++            rope_qkv_set_rows_navi22_data,
++            "main",
++            9,
++            sizeof(vk_op_rope_qkv_set_rows_navi22_push_constants),
++            {64, 1, 1},
++            {},
++            1);
++    }
++
+     for (uint32_t i = 0; i < num_argsort_pipelines; ++i) {
+         uint32_t BLOCK_SIZE = 1u << std::min(i, device->max_workgroup_size_log2);
+         if (i <= device->max_workgroup_size_log2 &&
+@@ -5938,13 +6072,49 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+             !device->q4_k_mmvq_navi22_banner_logged.exchange(true)) {
+             fprintf(stderr, "ggml_vulkan: selected Q4_K x Q8_1 Navi22 MMVQ route (n=1, wave32, 2 rows/workgroup)\n");
+         }
++        if (task.pipeline->name == "rope_qkv_set_rows_navi22" &&
++            !device->post_qkv_fusion_navi22_banner_logged.exchange(true)) {
++            fprintf(stderr, "ggml_vulkan: selected fused Q/K RoPE plus K/V set-rows Navi22 route (64 lanes, 32 heads)\n");
++        }
+         if (task.pipeline->name == "mul_mat_vec_q4_0_q8_1_f32_navi22_rows2" &&
+             !device->q4_0_mmvq_navi22_banner_logged.exchange(true)) {
+             fprintf(stderr, "ggml_vulkan: selected Q4_0 x Q8_1 Navi22 MMVQ route (n=1, wave64, 2 rows/workgroup)\n");
+         }
+-        if (task.pipeline->name == "mul_mat_vec_q4_0_q8_1_f32_multiproj_navi22" &&
++        if ((task.pipeline->name == "mul_mat_vec_q4_0_q8_1_f32_navi22_rows1_shape" ||
++             task.pipeline->name == "mul_mat_vec_q4_0_q8_1_f32_navi22_down_prefetch") &&
++            !device->q4_0_mmvq_navi22_rows1_banner_logged.exchange(true)) {
++            const char * mode = device->q4_0_mmvq_navi22_rows1_mode == 1 ? "down" :
++                                device->q4_0_mmvq_navi22_rows1_mode == 2 ? "attention" : "all";
++            fprintf(stderr, "ggml_vulkan: selected shape-specific Q4_0 x Q8_1 Navi22 MMVQ route (n=1, wave64, 1 row/workgroup, mode=%s)\n", mode);
++        }
++        if (task.pipeline->name == "mul_mat_vec_q4_0_q8_1_f32_navi22_down_prefetch" &&
++            !device->q4_0_down_prefetch_navi22_banner_logged.exchange(true)) {
++            fprintf(stderr, "ggml_vulkan: selected Q4_0 down-projection next-block-prefetch route (n=1, wave64, lookahead=1, exact_k=11008)\n");
++        }
++        if (task.pipeline->name == "mul_mat_vec_p021_f16_f32_wave32_navi22" &&
++            !device->f16_attn_p021_navi22_banner_logged.exchange(true)) {
++            fprintf(stderr, "ggml_vulkan: selected F16 p021 attention Navi22 route (AV, wave32)\n");
++        }
++        if (task.pipeline->name == "mul_mat_vec_nc_f16_f32_subgroup_navi22" &&
++            !device->f16_attn_nc_navi22_banner_logged.exchange(true)) {
++            fprintf(stderr, "ggml_vulkan: selected F16 non-contiguous attention Navi22 route (QK, wave32 subgroup reduction)\n");
++        }
++        if ((task.pipeline->name == "mul_mat_vec_f16_f32_f32_navi22_attn_rows1" ||
++             task.pipeline->name == "mul_mat_vec_f16_f32_f32_navi22_attn_rows4" ||
++             task.pipeline->name == "mul_mat_vec_f16_f32_f32_navi22_attn_rows8" ||
++             task.pipeline->name == "mul_mat_vec_f16_f32_f32_navi22_attn_rows8_dualwave" ||
++             task.pipeline->name == "mul_mat_vec_f16_f32_f32_navi22_attn_rows16") &&
++            !device->f16_attn_mmv_navi22_banner_logged.exchange(true)) {
++            if (task.pipeline->name == "mul_mat_vec_f16_f32_f32_navi22_attn_rows8_dualwave") {
++                fprintf(stderr, "ggml_vulkan: selected F16 attention MMV Navi22 route (wave32, 8 rows/wave, 2 waves/workgroup)\n");
++            } else {
++                fprintf(stderr, "ggml_vulkan: selected F16 attention MMV Navi22 route (wave32, %u rows/workgroup)\n", device->f16_attn_mmv_navi22_rows);
++            }
++        }
++        if ((task.pipeline->name == "mul_mat_vec_q4_0_q8_1_f32_multiproj_navi22" ||
++             task.pipeline->name == "mul_mat_vec_q4_0_q8_1_f32_multiproj_qkv_rows1_navi22") &&
+             !device->q4_0_multiproj_navi22_banner_logged.exchange(true)) {
+-            fprintf(stderr, "ggml_vulkan: selected Q4_0 Navi22 multi-projection MMVQ route (wave64, 2 rows/workgroup)\n");
++            fprintf(stderr, "ggml_vulkan: selected Q4_0 Navi22 multi-projection MMVQ route (wave64, QKV 1 row/workgroup, FFN 2 rows/workgroup)\n");
+         }
+     }
+ 
+@@ -6761,6 +6931,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
+         }
+ 
+         const char * q4_0_mmvq_navi22_env = getenv("GGML_VK_Q4_0_MMVQ_NAVI22");
++        const char * q4_0_mmvq_navi22_rows1_env = getenv("GGML_VK_Q4_0_MMVQ_NAVI22_ROWS1_SHAPE");
+         if (getenv("GGML_VK_Q4_0_MMVQ_NAVI22_MODE") != nullptr ||
+             getenv("GGML_VK_Q4_0_MMVQ_NAVI22_ROWS") != nullptr ||
+             getenv("GGML_VK_Q4_0_MMVQ_NAVI22_CONTRACTION") != nullptr) {
+@@ -6806,6 +6977,148 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             }
+             device->q4_0_mmvq_navi22 = true;
+         }
++        if (q4_0_mmvq_navi22_rows1_env != nullptr) {
++            const char * rejection_reason = nullptr;
++            if (!device->q4_0_mmvq_navi22) {
++                rejection_reason = "GGML_VK_Q4_0_MMVQ_NAVI22=1 is required";
++            } else if (strcmp(q4_0_mmvq_navi22_rows1_env, "down") == 0) {
++                device->q4_0_mmvq_navi22_rows1_mode = 1;
++            } else if (strcmp(q4_0_mmvq_navi22_rows1_env, "attention") == 0) {
++                device->q4_0_mmvq_navi22_rows1_mode = 2;
++            } else if (strcmp(q4_0_mmvq_navi22_rows1_env, "all") == 0) {
++                device->q4_0_mmvq_navi22_rows1_mode = 3;
++            } else {
++                rejection_reason = "the value must be exactly down, attention, or all";
++            }
++
++            if (rejection_reason != nullptr) {
++                GGML_LOG_ERROR("ggml_vulkan: GGML_VK_Q4_0_MMVQ_NAVI22_ROWS1_SHAPE rejected: %s\n", rejection_reason);
++                throw std::runtime_error(std::string("GGML_VK_Q4_0_MMVQ_NAVI22_ROWS1_SHAPE rejected: ") + rejection_reason);
++            }
++        }
++
++        const char * q4_0_down_prefetch_navi22_env = getenv("GGML_VK_Q4_0_DOWN_PREFETCH_NAVI22");
++        if (q4_0_down_prefetch_navi22_env != nullptr) {
++            const char * rejection_reason = nullptr;
++            if (strcmp(q4_0_down_prefetch_navi22_env, "1") != 0) {
++                rejection_reason = "the environment value must be exactly 1";
++            } else if (!device->q4_0_mmvq_navi22) {
++                rejection_reason = "GGML_VK_Q4_0_MMVQ_NAVI22=1 is required";
++            } else if (device->q4_0_mmvq_navi22_rows1_mode != 1 &&
++                       device->q4_0_mmvq_navi22_rows1_mode != 3) {
++                rejection_reason = "GGML_VK_Q4_0_MMVQ_NAVI22_ROWS1_SHAPE must be down or all";
++#if !defined(GGML_VULKAN_INTEGER_DOT_GLSLC_SUPPORT)
++            } else {
++                rejection_reason = "this build does not contain integer-dot-product Vulkan shaders";
++#endif
++            }
++
++            if (rejection_reason != nullptr) {
++                GGML_LOG_ERROR("ggml_vulkan: GGML_VK_Q4_0_DOWN_PREFETCH_NAVI22 rejected: %s\n", rejection_reason);
++                throw std::runtime_error(std::string("GGML_VK_Q4_0_DOWN_PREFETCH_NAVI22 rejected: ") + rejection_reason);
++            }
++            device->q4_0_down_prefetch_navi22 = true;
++        }
++
++        const char * post_qkv_fusion_navi22_env = getenv("GGML_VK_POST_QKV_FUSION_NAVI22");
++        if (post_qkv_fusion_navi22_env != nullptr) {
++            const char * rejection_reason = nullptr;
++            if (strcmp(post_qkv_fusion_navi22_env, "1") != 0) {
++                rejection_reason = "the environment value must be exactly 1";
++            } else if (device->vendor_id != VK_VENDOR_ID_AMD ||
++                       device->properties.deviceID != navi22_rx_6700_xt_device_id) {
++                rejection_reason = "the selected device is not an AMD Radeon RX 6700 XT (device ID 0x73df)";
++            } else if (device->architecture != vk_device_architecture::AMD_RDNA2) {
++                rejection_reason = "the selected device was not detected as RDNA2";
++            } else if (device->driver_id != vk::DriverId::eMesaRadv) {
++                rejection_reason = "the selected Vulkan driver is not Mesa RADV";
++            } else if (getenv("GGML_VK_DISABLE_FUSION") != nullptr ||
++                       getenv("GGML_VK_DISABLE_GRAPH_OPTIMIZE") != nullptr) {
++                rejection_reason = "graph fusion and graph optimization must remain enabled";
++            } else if (device->properties.limits.maxComputeWorkGroupInvocations < 64 ||
++                       device->properties.limits.maxComputeWorkGroupSize[0] < 64) {
++                rejection_reason = "a 64-invocation compute workgroup is unavailable";
++            }
++
++            if (rejection_reason != nullptr) {
++                GGML_LOG_ERROR("ggml_vulkan: GGML_VK_POST_QKV_FUSION_NAVI22 rejected: %s\n", rejection_reason);
++                throw std::runtime_error(std::string("GGML_VK_POST_QKV_FUSION_NAVI22 rejected: ") + rejection_reason);
++            }
++            device->post_qkv_fusion_navi22 = true;
++        }
++
++        const char * f16_attn_navi22_mode_env = getenv("GGML_VK_F16_ATTN_NAVI22_MODE");
++        if (f16_attn_navi22_mode_env != nullptr) {
++            const char * rejection_reason = nullptr;
++            if (strcmp(f16_attn_navi22_mode_env, "nc") == 0) {
++                device->f16_attn_navi22_mode = 1;
++            } else if (strcmp(f16_attn_navi22_mode_env, "p021") == 0) {
++                device->f16_attn_navi22_mode = 2;
++            } else if (strcmp(f16_attn_navi22_mode_env, "both") == 0) {
++                device->f16_attn_navi22_mode = 3;
++            } else {
++                rejection_reason = "the value must be exactly nc, p021, or both";
++            }
++            if (device->vendor_id != VK_VENDOR_ID_AMD ||
++                device->properties.deviceID != navi22_rx_6700_xt_device_id) {
++                rejection_reason = "the selected device is not an AMD Radeon RX 6700 XT (device ID 0x73df)";
++            } else if (device->architecture != vk_device_architecture::AMD_RDNA2) {
++                rejection_reason = "the selected device was not detected as RDNA2";
++            } else if (device->driver_id != vk::DriverId::eMesaRadv) {
++                rejection_reason = "the selected Vulkan driver is not Mesa RADV";
++            } else if (!device->subgroup_basic || !device->subgroup_arithmetic ||
++                       !device->subgroup_size_control || device->subgroup_min_size > 32 ||
++                       device->subgroup_max_size < 32 || !device->subgroup_require_full_support) {
++                rejection_reason = "a full required subgroup size of 32 with arithmetic is unavailable";
++            } else if (device->properties.limits.maxComputeWorkGroupInvocations < 32 ||
++                       device->properties.limits.maxComputeWorkGroupSize[0] < 32) {
++                rejection_reason = "a 32-invocation compute workgroup is unavailable";
++            }
++
++            if (rejection_reason != nullptr) {
++                GGML_LOG_ERROR("ggml_vulkan: GGML_VK_F16_ATTN_NAVI22_MODE rejected: %s\n", rejection_reason);
++                throw std::runtime_error(std::string("GGML_VK_F16_ATTN_NAVI22_MODE rejected: ") + rejection_reason);
++            }
++        }
++
++        const char * f16_attn_mmv_navi22_rows_env = getenv("GGML_VK_F16_ATTN_MMV_NAVI22_ROWS");
++        if (f16_attn_mmv_navi22_rows_env != nullptr) {
++            const char * rejection_reason = nullptr;
++            if (strcmp(f16_attn_mmv_navi22_rows_env, "1") == 0) {
++                device->f16_attn_mmv_navi22_rows = 1;
++            } else if (strcmp(f16_attn_mmv_navi22_rows_env, "4") == 0) {
++                device->f16_attn_mmv_navi22_rows = 4;
++            } else if (strcmp(f16_attn_mmv_navi22_rows_env, "8") == 0) {
++                device->f16_attn_mmv_navi22_rows = 8;
++            } else if (strcmp(f16_attn_mmv_navi22_rows_env, "16") == 0) {
++                device->f16_attn_mmv_navi22_rows = 16;
++            } else {
++                rejection_reason = "the value must be exactly 1, 4, 8, or 16";
++            }
++            if (device->vendor_id != VK_VENDOR_ID_AMD ||
++                device->properties.deviceID != navi22_rx_6700_xt_device_id) {
++                rejection_reason = "the selected device is not an AMD Radeon RX 6700 XT (device ID 0x73df)";
++            } else if (device->architecture != vk_device_architecture::AMD_RDNA2) {
++                rejection_reason = "the selected device was not detected as RDNA2";
++            } else if (device->driver_id != vk::DriverId::eMesaRadv) {
++                rejection_reason = "the selected Vulkan driver is not Mesa RADV";
++            } else if (!device->subgroup_basic || !device->subgroup_arithmetic ||
++                       !device->subgroup_size_control || device->subgroup_min_size > 32 ||
++                       device->subgroup_max_size < 32 || !device->subgroup_require_full_support) {
++                rejection_reason = "a full required subgroup size of 32 is unavailable";
++            } else if (device->properties.limits.maxComputeWorkGroupInvocations <
++                           32 * device->f16_attn_mmv_navi22_rows ||
++                       device->properties.limits.maxComputeWorkGroupSize[0] < 32 ||
++                       device->properties.limits.maxComputeWorkGroupSize[1] <
++                           device->f16_attn_mmv_navi22_rows) {
++                rejection_reason = "the selected 32xrows compute workgroup is unavailable";
++            }
++
++            if (rejection_reason != nullptr) {
++                GGML_LOG_ERROR("ggml_vulkan: GGML_VK_F16_ATTN_MMV_NAVI22_ROWS rejected: %s\n", rejection_reason);
++                throw std::runtime_error(std::string("GGML_VK_F16_ATTN_MMV_NAVI22_ROWS rejected: ") + rejection_reason);
++            }
++        }
+ 
+         const char * q4_0_multiproj_navi22_env = getenv("GGML_VK_Q4_0_MULTIPROJ_NAVI22");
+         if (getenv("GGML_VK_Q4_0_MULTIPROJ_NAVI22_MODE") != nullptr ||
+@@ -6936,6 +7249,29 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             device->flash_attn_q8_1_navi22 = true;
+         }
+ 
++        const char * fa_masked_split_navi22_env = getenv("GGML_VK_FA_MASKED_SPLIT_NAVI22");
++        if (fa_masked_split_navi22_env != nullptr) {
++            const char * rejection_reason = nullptr;
++            if (strcmp(fa_masked_split_navi22_env, "1") != 0) {
++                rejection_reason = "the environment value must be exactly 1";
++            } else if (!device->flash_attn_q8_1_navi22) {
++                rejection_reason = "GGML_VK_FLASH_ATTN_Q8_1_NAVI22=1 is required";
++            } else if (!device->subgroup_shuffle) {
++                rejection_reason = "compute-stage subgroup shuffle operations are required";
++            } else if (device->properties.limits.maxComputeWorkGroupInvocations < 128 ||
++                       device->properties.limits.maxComputeWorkGroupSize[0] < 128) {
++                rejection_reason = "a 128-invocation compute workgroup is unavailable";
++            } else if (device->properties.limits.maxComputeSharedMemorySize < 1024) {
++                rejection_reason = "less than 1024 bytes of compute shared memory are available";
++            }
++
++            if (rejection_reason != nullptr) {
++                GGML_LOG_ERROR("ggml_vulkan: GGML_VK_FA_MASKED_SPLIT_NAVI22 rejected: %s\n", rejection_reason);
++                throw std::runtime_error(std::string("GGML_VK_FA_MASKED_SPLIT_NAVI22 rejected: ") + rejection_reason);
++            }
++            device->fa_masked_split_navi22 = true;
++        }
++
+         // Shaders
+         // Disable matmul tile sizes early if performance low or not supported
+         for (uint32_t i = 0; i < GGML_TYPE_COUNT; ++i) {
+@@ -7749,6 +8085,18 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+     GGML_ASSERT(b_type == GGML_TYPE_F32 || b_type == GGML_TYPE_F16 || b_type == GGML_TYPE_Q8_1);
+     GGML_ASSERT(num_cols >= 1 && num_cols <= mul_mat_vec_max_cols);
+ 
++    if (b_type == GGML_TYPE_F32 && a_type == GGML_TYPE_F16 && num_cols == 1 &&
++        ctx->device->f16_attn_mmv_navi22_rows != 0 &&
++        m == 128 && k == 256) {
++        switch (ctx->device->f16_attn_mmv_navi22_rows) {
++            case 1:  return ctx->device->pipeline_f16_attn_mmv_rows1_navi22;
++            case 4:  return ctx->device->pipeline_f16_attn_mmv_rows4_navi22;
++            case 8:  return ctx->device->pipeline_f16_attn_mmv_rows8_navi22;
++            case 16: return ctx->device->pipeline_f16_attn_mmv_rows16_navi22;
++            default: GGML_ABORT("invalid F16 attention MMV Navi22 row packing");
++        }
++    }
++
+     if (b_type == GGML_TYPE_Q8_1) {
+         switch (a_type) {
+             case GGML_TYPE_Q2_0:
+@@ -7824,6 +8172,25 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context *
+         if (ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+             dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
+         }
++        if (ctx->device->q4_0_mmvq_navi22_rows1_mode != 0 &&
++            dmmv_wg == DMMV_WG_SIZE_SUBGROUP && a_type == GGML_TYPE_Q4_0 && num_cols == 1) {
++            const bool down_shape = m == 4096 && k == 11008;
++            const bool attention_shape = m == 4096 && k == 4096;
++            if (ctx->device->q4_0_mmvq_navi22_rows1_mode == 3 ||
++                (ctx->device->q4_0_mmvq_navi22_rows1_mode == 1 && down_shape) ||
++                (ctx->device->q4_0_mmvq_navi22_rows1_mode == 2 && attention_shape)) {
++                if (down_shape && ctx->device->q4_0_down_prefetch_navi22) {
++                    return ctx->device->pipeline_q4_0_mmvq_rows1_k11008_prefetch_navi22;
++                }
++                return down_shape ? ctx->device->pipeline_q4_0_mmvq_rows1_k11008_navi22
++                                  : ctx->device->pipeline_q4_0_mmvq_rows1_navi22;
++            }
++        }
++        if (ctx->device->q4_0_mmvq_navi22 && dmmv_wg == DMMV_WG_SIZE_SUBGROUP &&
++            a_type == GGML_TYPE_Q4_0 && num_cols == 1 && k == 4096 &&
++            (m == 4096 || m == 11008)) {
++            return ctx->device->pipeline_q4_0_mmvq_rows2_k4096_navi22;
++        }
+         return ctx->device->pipeline_dequant_mul_mat_vec_q8_1_f32[dmmv_wg][a_type][num_cols-1];
+     }
+ 
+@@ -9728,6 +10095,27 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
+                                   pc, { groups_x, groups_y, groups_z });
+         if (dmmv->name == "mul_mat_vec_q4_0_q8_1_f32_navi22_rows2") {
+             ++ctx->q4_0_mmvq_navi22_dispatches;
++        } else if (dmmv->name == "mul_mat_vec_q4_0_q8_1_f32_navi22_rows1_shape" ||
++                   dmmv->name == "mul_mat_vec_q4_0_q8_1_f32_navi22_down_prefetch") {
++            ++ctx->q4_0_mmvq_navi22_dispatches;
++            ++ctx->q4_0_mmvq_navi22_rows1_dispatches;
++            if (ne01 == 4096 && ne00 == 11008) {
++                ++ctx->q4_0_mmvq_navi22_rows1_down_dispatches;
++                if (dmmv->name == "mul_mat_vec_q4_0_q8_1_f32_navi22_down_prefetch") {
++                    ++ctx->q4_0_down_prefetch_navi22_dispatches;
++                }
++            } else if (ne01 == 4096 && ne00 == 4096) {
++                ++ctx->q4_0_mmvq_navi22_rows1_attention_dispatches;
++            }
++        } else if (dmmv->name == "mul_mat_vec_f16_f32_f32_navi22_attn_rows1" ||
++                   dmmv->name == "mul_mat_vec_f16_f32_f32_navi22_attn_rows4" ||
++                   dmmv->name == "mul_mat_vec_f16_f32_f32_navi22_attn_rows8" ||
++                   dmmv->name == "mul_mat_vec_f16_f32_f32_navi22_attn_rows8_dualwave" ||
++                   dmmv->name == "mul_mat_vec_f16_f32_f32_navi22_attn_rows16") {
++            ++ctx->f16_attn_mmv_navi22_dispatches;
++            if (ne01 == 128 && ne00 == 256) {
++                ++ctx->f16_attn_mmv_navi22_qk_dispatches;
++            }
+         }
+         base_work_group_y += groups_y;
+     }
+@@ -9818,6 +10206,7 @@ static uint32_t ggml_vk_q4_0_multiproj_eligible(
+     }
+ 
+     if (ctx->device->pipeline_q4_0_multiproj_navi22 == nullptr ||
++        (count == 3 && ctx->device->pipeline_q4_0_multiproj_qkv_rows1_navi22 == nullptr) ||
+         !ggml_vk_should_use_mmvq(ctx->device, (uint32_t) first->ne[0], 1, 4096, GGML_TYPE_Q4_0) ||
+         ctx->device->properties.limits.maxComputeWorkGroupCount[0] < (uint32_t) CEIL_DIV(first->ne[0], 2) ||
+         ctx->device->properties.limits.maxComputeWorkGroupCount[1] < count ||
+@@ -9874,14 +10263,52 @@ static uint32_t ggml_vk_q4_0_multiproj_eligible(
+     return count;
+ }
+ 
++static bool ggml_vk_q4_0_multiproj_ffn_swiglu_eligible(
++        ggml_backend_vk_context * ctx,
++        const ggml_cgraph * cgraph,
++        int node_idx) {
++    if (node_idx < 0 || node_idx + 2 >= cgraph->n_nodes ||
++        ctx->device->pipeline_q4_0_multiproj_ffn_swiglu_navi22 == nullptr) {
++        return false;
++    }
++
++    const ggml_tensor * first = cgraph->nodes[node_idx];
++    const ggml_tensor * second = cgraph->nodes[node_idx + 1];
++    const ggml_tensor * glu = cgraph->nodes[node_idx + 2];
++    if (ggml_vk_q4_0_multiproj_expected_count(first) != 2 ||
++        !ggml_vk_q4_0_multiproj_matches(first, second) ||
++        glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
++        glu->src[0] == nullptr || glu->src[1] == nullptr ||
++        !((glu->src[0] == first && glu->src[1] == second) ||
++          (glu->src[0] == second && glu->src[1] == first)) ||
++        glu->type != GGML_TYPE_F32 || glu->src[0]->type != GGML_TYPE_F32 || glu->src[1]->type != GGML_TYPE_F32 ||
++        !ggml_are_same_shape(first, glu) || !ggml_are_same_shape(second, glu) ||
++        !ggml_is_contiguous(glu) || glu->buffer == nullptr || get_misalign_bytes(ctx, glu) != 0 ||
++        ggml_nbytes(glu) > ctx->device->properties.limits.maxStorageBufferRange) {
++        return false;
++    }
++
++    uint32_t first_consumers = 0;
++    uint32_t second_consumers = 0;
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
++            first_consumers += cgraph->nodes[i]->src[s] == first;
++            second_consumers += cgraph->nodes[i]->src[s] == second;
++        }
++    }
++    return first_consumers == 1 && second_consumers == 1;
++}
++
+ static void ggml_vk_q4_0_multiproj(
+         ggml_backend_vk_context * ctx,
+         vk_context & subctx,
+         const ggml_cgraph * cgraph,
+         int node_idx) {
+     const uint32_t count = ctx->q4_0_multiproj_count;
++    const bool fused_ffn_swiglu = ctx->q4_0_multiproj_ffn_swiglu;
+     GGML_ASSERT(count == 2 || count == 3);
+     GGML_ASSERT(node_idx >= 0 && node_idx + (int) count <= cgraph->n_nodes);
++    GGML_ASSERT(!fused_ffn_swiglu || (count == 2 && node_idx + 2 < cgraph->n_nodes));
+     GGML_ASSERT(ggml_vk_q4_0_multiproj_expected_count(cgraph->nodes[node_idx]) == count);
+     for (uint32_t i = 1; i < count; ++i) {
+         GGML_ASSERT(ggml_vk_q4_0_multiproj_matches(cgraph->nodes[node_idx], cgraph->nodes[node_idx + i]));
+@@ -9937,22 +10364,35 @@ static void ggml_vk_q4_0_multiproj(
+         outputs[2] = outputs[1];
+     }
+ 
++    std::array<uint32_t, 3> projection_order {0, 1, 2};
++    if (fused_ffn_swiglu) {
++        const ggml_tensor * glu = cgraph->nodes[node_idx + 2];
++        GGML_ASSERT(glu->src[0] == cgraph->nodes[node_idx] || glu->src[0] == cgraph->nodes[node_idx + 1]);
++        if (glu->src[0] == cgraph->nodes[node_idx + 1]) {
++            std::swap(projection_order[0], projection_order[1]);
++        }
++        outputs[2] = ggml_vk_tensor_subbuffer(ctx, glu);
++    }
++
+     const uint64_t block_bytes = ggml_type_size(GGML_TYPE_Q4_0);
+     const vk_q4_0_multiproj_push_constants pc = {
+         4096,
+         (uint32_t) cgraph->nodes[node_idx]->ne[0],
+         count,
+-        (uint32_t) ((weights[0].offset - span_begin) / block_bytes),
+-        (uint32_t) ((weights[1].offset - span_begin) / block_bytes),
+-        count == 3 ? (uint32_t) ((weights[2].offset - span_begin) / block_bytes) : 0,
++        (uint32_t) ((weights[projection_order[0]].offset - span_begin) / block_bytes),
++        (uint32_t) ((weights[projection_order[1]].offset - span_begin) / block_bytes),
++        count == 3 ? (uint32_t) ((weights[projection_order[2]].offset - span_begin) / block_bytes) : 0,
+     };
+ 
+-    vk_pipeline pipeline = ctx->device->pipeline_q4_0_multiproj_navi22;
++    const bool shared_qkv = count == 3;
++    vk_pipeline pipeline = fused_ffn_swiglu ? ctx->device->pipeline_q4_0_multiproj_ffn_swiglu_navi22 :
++                           shared_qkv ? ctx->device->pipeline_q4_0_multiproj_qkv_rows1_navi22 :
++                                        ctx->device->pipeline_q4_0_multiproj_navi22;
+     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+     ggml_vk_dispatch_pipeline(
+         ctx, subctx, pipeline,
+         {weight_span, q8_buf, outputs[0], outputs[1], outputs[2]},
+-        pc, {(uint32_t) cgraph->nodes[node_idx]->ne[0], count, 1});
++        pc, {(uint32_t) cgraph->nodes[node_idx]->ne[0], (shared_qkv || fused_ffn_swiglu) ? 1u : count, 1});
+ 
+     ctx->prealloc_y_need_sync = true;
+     ctx->q4_0_mmvq_navi22_dispatches += count;
+@@ -9962,6 +10402,9 @@ static void ggml_vk_q4_0_multiproj(
+         ++ctx->q4_0_multiproj_qkv_groups;
+     } else {
+         ++ctx->q4_0_multiproj_ffn_groups;
++        if (fused_ffn_swiglu) {
++            ++ctx->q4_0_multiproj_ffn_swiglu_groups;
++        }
+     }
+ }
+ 
+@@ -9997,7 +10440,12 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
+         gqa_ratio = 1;
+     }
+ 
+-    vk_pipeline pipeline = ctx->device->pipeline_mul_mat_vec_p021_f16_f32[gqa_ratio - 1];
++    const bool use_navi22 = (ctx->device->f16_attn_navi22_mode & 2u) != 0 &&
++        ctx->num_additional_fused_ops == 0 && gqa_ratio == 1 &&
++        ne00 == 128 && ne01 == 256 && ne02 == 32 && ne12 == 32;
++    vk_pipeline pipeline = use_navi22 ?
++        ctx->device->pipeline_mul_mat_vec_p021_f16_f32_wave32_navi22 :
++        ctx->device->pipeline_mul_mat_vec_p021_f16_f32[gqa_ratio - 1];
+ 
+     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
+@@ -10055,6 +10503,9 @@ static void ggml_vk_mul_mat_vec_p021_f16_f32(ggml_backend_vk_context * ctx, vk_c
+             d_F0,
+             d_F1,
+         }, pc, { 1, (uint32_t)ne01, workgroups_z });
++    if (use_navi22) {
++        ++ctx->f16_attn_p021_navi22_dispatches;
++    }
+ }
+ 
+ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
+@@ -10097,7 +10548,11 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
+     const uint32_t channel_stride_x = nb02 / sizeof(ggml_fp16_t);
+     const uint32_t channel_stride_y = nb12 / sizeof(float);
+ 
+-    vk_pipeline pipeline = ctx->device->pipeline_mul_mat_vec_nc_f16_f32;
++    const bool use_navi22 = (ctx->device->f16_attn_navi22_mode & 1u) != 0 &&
++        ne00 == 256 && ne01 == 128 && ne02 == 32 && ne03 == 1 && ne12 == 32;
++    vk_pipeline pipeline = use_navi22 ?
++        ctx->device->pipeline_mul_mat_vec_nc_f16_f32_subgroup_navi22 :
++        ctx->device->pipeline_mul_mat_vec_nc_f16_f32;
+     if (ggml_nbytes(src0) > ctx->device->properties.limits.maxStorageBufferRange) {
+         pipeline = ggml_vk_get_64b_indexing_pipeline(ctx, pipeline);
+     }
+@@ -10149,6 +10604,9 @@ static void ggml_vk_mul_mat_vec_nc_f16_f32(ggml_backend_vk_context * ctx, vk_con
+             d_F0,
+             d_F1,
+         }, pc, { (uint32_t)ne03, (uint32_t)ne01, (uint32_t)ne12 });
++    if (use_navi22) {
++        ++ctx->f16_attn_nc_navi22_dispatches;
++    }
+ }
+ 
+ static int ggml_vk_fwht_pipeline_idx(int64_t n) {
+@@ -11188,8 +11646,19 @@ static void ggml_vk_flash_attn(
+     // Only use mask opt when the mask is fairly large. This hasn't been tuned extensively.
+     bool use_mask_opt = mask && nem1 >= 32 && nem0 * nem1 > 32768 && nem0 >= tuning_params.block_cols * 16
+                         && (ctx->device->architecture != vk_device_architecture::AMD_GCN || HSK > 256 || HSV > 256);
++    // During single-token causal decode, the final mask tile is commonly only
++    // partly populated. The generic scalar shader otherwise performs the QK
++    // dot and V accumulation for every -inf column in that tile even though
++    // its softmax probability is exactly zero. Restrict this specialization to
++    // the already exact-shaped Navi22 FA->Q8 route; generic and fallback paths
++    // keep their existing behavior.
++    const bool cull_mask_neg_inf = q8_activation != nullptr && N == 1 && KV == 256 &&
++                                   tuning_params.path == FA_SCALAR && tuning_params.block_rows == 1 &&
++                                   tuning_params.block_cols == 64 && aligned && f32acc &&
++                                   mask != nullptr && !use_mask_opt && max_bias == 0.0f && logit_softcap == 0.0f;
+     vk_fa_pipeline_state fa_pipeline_state = get_fa_pipeline_state(ctx->device, tuning_params, HSK, HSV, aligned, f32acc,
+-                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0, k->type, v->type);
++                                                                   mask != nullptr, use_mask_opt, logit_softcap != 0,
++                                                                   cull_mask_neg_inf, k->type, v->type);
+ 
+     vk_pipeline pipeline = nullptr;
+ 
+@@ -11244,6 +11713,10 @@ static void ggml_vk_flash_attn(
+     if (fuse_q8) {
+         ++ctx->flash_attn_q8_1_split2;
+     }
++    const bool masked_split_direct = ctx->device->fa_masked_split_navi22 && fuse_q8 &&
++                                     cull_mask_neg_inf && split_kv == 128 && HSK == 128 && HSV == 128 &&
++                                     ne1 == 32 && ne2 == 1 && ne3 == 1 &&
++                                     workgroups_y == 32 && workgroups_z == 1;
+ 
+     // Reserve space for split_k temporaries. For each split x batch, we need to store the O matrix (D x ne1)
+     // and the per-row m and L values (ne1 rows). We store all the matrices first, followed by the rows.
+@@ -11348,6 +11821,33 @@ static void ggml_vk_flash_attn(
+                                               mask_n_head_log2, m0, m1,
+                                               gqa_ratio, split_kv, split_k };
+ 
++    if (masked_split_direct) {
++        vk_pipeline direct_pipeline = ctx->device->pipeline_flash_attn_masked_split_q8_1_x4_navi22;
++        GGML_ASSERT(direct_pipeline != nullptr && q8_size != 0);
++        ggml_pipeline_request_descriptor_sets(ctx, direct_pipeline, 1);
++
++        if (ctx->prealloc_y_need_sync || ctx->prealloc_y_fused_q8_write_pending) {
++            ggml_vk_sync_buffers(ctx, subctx);
++        }
++
++        const vk_subbuffer q8_buf = { ctx->prealloc_y, 0, q8_size };
++        ggml_vk_dispatch_pipeline(ctx, subctx, direct_pipeline,
++                                  { q_buf, k_buf, v_buf, mask_buf, dst_buf, q8_buf },
++                                  pc, { 1, workgroups_y, workgroups_z });
++
++        vk_pipeline to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
++        GGML_ASSERT(to_q8_1 != nullptr);
++        ctx->prealloc_y_last_pipeline_used = to_q8_1.get();
++        ctx->prealloc_y_last_tensor_used = q8_activation;
++        ctx->prealloc_y_last_decode_vector_staging = false;
++        ctx->prealloc_y_fused_q8_write_pending = true;
++        ctx->prealloc_y_flash_attn_q8_1_tensor = q8_activation;
++        ctx->prealloc_y_need_sync = true;
++        ++ctx->flash_attn_q8_1_masked_split_direct;
++        ++ctx->flash_attn_q8_1_produced;
++        return;
++    }
++
+     if (split_k > 1) {
+         vk_pipeline reduce_pipeline = fuse_q8 ?
+             ctx->device->pipeline_flash_attn_split_k_reduce_q8_1_x4_navi22 :
+@@ -14022,6 +14522,65 @@ static void ggml_vk_rope(ggml_backend_vk_context * ctx, vk_context& subctx, cons
+         ggml_vk_make_rope_constants(cgraph->nodes[node_idx], src0, src2 != nullptr, backprop, set_rows_stride));
+ }
+ 
++static void ggml_vk_rope_qkv_set_rows_navi22(
++        ggml_backend_vk_context * ctx,
++        vk_context& subctx,
++        const ggml_cgraph * cgraph,
++        int node_idx) {
++    GGML_ASSERT(ctx->device->post_qkv_fusion_navi22);
++    GGML_ASSERT(ctx->num_additional_fused_ops == 4);
++
++    const ggml_tensor * q_rope = cgraph->nodes[node_idx + 0];
++    const ggml_tensor * k_rope = cgraph->nodes[node_idx + 1];
++    const ggml_tensor * k_set  = cgraph->nodes[node_idx + 3];
++    const ggml_tensor * v_set  = cgraph->nodes[node_idx + 4];
++    const ggml_tensor * q_src = q_rope->src[0];
++    const ggml_tensor * k_src = k_rope->src[0];
++    const ggml_tensor * v_src = v_set->src[0];
++    const ggml_tensor * pos = q_rope->src[1];
++    const ggml_tensor * k_indices = k_set->src[1];
++    const ggml_tensor * v_indices = v_set->src[1];
++    const bool v_scalar_rows = v_src->ne[0] == 1;
++
++    vk_op_rope_qkv_set_rows_navi22_push_constants pc {
++        powf(10000.0f, -2.0f / 128.0f),
++        (uint32_t)(k_set->nb[1] / ggml_type_size(k_set->type)),
++        (uint32_t)(v_set->nb[1] / ggml_type_size(v_set->type)),
++        get_misalign_bytes(ctx, q_src) / ggml_type_size(q_src->type),
++        get_misalign_bytes(ctx, k_src) / ggml_type_size(k_src->type),
++        get_misalign_bytes(ctx, v_src) / ggml_type_size(v_src->type),
++        get_misalign_bytes(ctx, pos) / ggml_type_size(pos->type),
++        get_misalign_bytes(ctx, q_rope) / ggml_type_size(q_rope->type),
++        get_misalign_bytes(ctx, k_set) / ggml_type_size(k_set->type),
++        get_misalign_bytes(ctx, v_set) / ggml_type_size(v_set->type),
++        get_misalign_bytes(ctx, k_indices) / ggml_type_size(k_indices->type),
++        get_misalign_bytes(ctx, v_indices) / ggml_type_size(v_indices->type),
++        v_scalar_rows ? 1u : 0u,
++    };
++
++    vk_pipeline pipeline = ctx->device->pipeline_rope_qkv_set_rows_navi22;
++    GGML_ASSERT(pipeline != nullptr);
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++    ggml_vk_dispatch_pipeline(
++        ctx,
++        subctx,
++        pipeline,
++        {
++            ggml_vk_tensor_subbuffer(ctx, q_src, true),
++            ggml_vk_tensor_subbuffer(ctx, k_src, true),
++            ggml_vk_tensor_subbuffer(ctx, v_src, true),
++            ggml_vk_tensor_subbuffer(ctx, pos, true),
++            ggml_vk_tensor_subbuffer(ctx, q_rope, true),
++            ggml_vk_tensor_subbuffer(ctx, k_set, true),
++            ggml_vk_tensor_subbuffer(ctx, v_set, true),
++            ggml_vk_tensor_subbuffer(ctx, k_indices, true),
++            ggml_vk_tensor_subbuffer(ctx, v_indices, true),
++        },
++        pc,
++        {64, 32, 1});
++    ++ctx->post_qkv_fusion_navi22_dispatches;
++}
++
+ static void ggml_vk_argsort(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+     const uint32_t * op_params = (const uint32_t *)dst->op_params;
+ 
+@@ -15961,7 +16520,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
+ 
+         break;
+     case GGML_OP_ROPE:
+-        ggml_vk_rope(ctx, compute_ctx, cgraph, node_idx, false);
++        if (ctx->num_additional_fused_ops == 4 && ctx->device->post_qkv_fusion_navi22) {
++            ggml_vk_rope_qkv_set_rows_navi22(ctx, compute_ctx, cgraph, node_idx);
++        } else {
++            ggml_vk_rope(ctx, compute_ctx, cgraph, node_idx, false);
++        }
+ 
+         break;
+     case GGML_OP_ROPE_BACK:
+@@ -17157,6 +17720,101 @@ static bool ggml_vk_can_fuse_rope_set_rows(ggml_backend_vk_context * ctx, const
+     return true;
+ }
+ 
++static bool ggml_vk_can_fuse_post_qkv_navi22(
++        ggml_backend_vk_context * ctx,
++        const struct ggml_cgraph * cgraph,
++        int node_idx) {
++    if (!ctx->device->post_qkv_fusion_navi22 || node_idx + 4 >= cgraph->n_nodes) {
++        return false;
++    }
++
++    const ggml_tensor * q_rope = cgraph->nodes[node_idx + 0];
++    const ggml_tensor * k_rope = cgraph->nodes[node_idx + 1];
++    const ggml_tensor * k_view = cgraph->nodes[node_idx + 2];
++    const ggml_tensor * k_set  = cgraph->nodes[node_idx + 3];
++    const ggml_tensor * v_set  = cgraph->nodes[node_idx + 4];
++
++    const ggml_tensor * q_src = q_rope->src[0];
++    const ggml_tensor * k_src = k_rope->src[0];
++    const ggml_tensor * v_src = v_set->src[0];
++    const ggml_tensor * pos = q_rope->src[1];
++    const ggml_tensor * k_indices = k_set->src[1];
++    const ggml_tensor * v_indices = v_set->src[1];
++
++    if (q_src == nullptr || k_src == nullptr || v_src == nullptr || pos == nullptr ||
++        k_indices == nullptr || v_indices == nullptr ||
++        q_rope->src[2] != nullptr || k_rope->src[2] != nullptr ||
++        k_rope->src[1] != pos) {
++        return false;
++    }
++
++    const int q_n_dims = ((const int32_t *) q_rope->op_params)[1];
++    const int q_mode = ((const int32_t *) q_rope->op_params)[2];
++    const int q_n_ctx_orig = ((const int32_t *) q_rope->op_params)[4];
++    const float q_freq_base = ((const float *) q_rope->op_params)[5];
++    const float q_freq_scale = ((const float *) q_rope->op_params)[6];
++    const float q_ext_factor = ((const float *) q_rope->op_params)[7];
++    const float q_attn_factor = ((const float *) q_rope->op_params)[8];
++    if (q_n_dims != 128 || q_mode != GGML_ROPE_TYPE_NORMAL || q_n_ctx_orig != 4096 ||
++        q_freq_base != 10000.0f || q_freq_scale != 1.0f ||
++        q_ext_factor != 0.0f || q_attn_factor != 1.0f) {
++        return false;
++    }
++    if (((const int32_t *) k_rope->op_params)[1] != q_n_dims ||
++        ((const int32_t *) k_rope->op_params)[2] != q_mode ||
++        ((const int32_t *) k_rope->op_params)[4] != q_n_ctx_orig ||
++        ((const float *) k_rope->op_params)[5] != q_freq_base ||
++        ((const float *) k_rope->op_params)[6] != q_freq_scale ||
++        ((const float *) k_rope->op_params)[7] != q_ext_factor ||
++        ((const float *) k_rope->op_params)[8] != q_attn_factor) {
++        return false;
++    }
++
++    const auto is_qk_shape = [](const ggml_tensor * tensor) {
++        return tensor->type == GGML_TYPE_F32 && tensor->ne[0] == 128 && tensor->ne[1] == 32 &&
++               tensor->ne[2] == 1 && tensor->ne[3] == 1 && ggml_is_contiguous(tensor);
++    };
++    const auto is_flat_row_shape = [](const ggml_tensor * tensor) {
++        return tensor->type == GGML_TYPE_F32 && tensor->ne[0] == 4096 && tensor->ne[1] == 1 &&
++               tensor->ne[2] == 1 && tensor->ne[3] == 1 && ggml_is_contiguous(tensor);
++    };
++    const auto is_cache_shape = [](const ggml_tensor * tensor) {
++        return tensor->type == GGML_TYPE_F16 && tensor->ne[0] == 4096 && tensor->ne[1] >= 1 &&
++               tensor->ne[2] == 1 && tensor->ne[3] == 1 && tensor->nb[0] == sizeof(ggml_fp16_t) &&
++               tensor->nb[1] == 4096 * sizeof(ggml_fp16_t) && ggml_is_contiguous(tensor);
++    };
++    const auto is_scalar_rows_shape = [](const ggml_tensor * tensor) {
++        return tensor->type == GGML_TYPE_F32 && tensor->ne[0] == 1 && tensor->ne[1] == 4096 &&
++               tensor->ne[2] == 1 && tensor->ne[3] == 1 && ggml_is_contiguous(tensor);
++    };
++    const auto is_flat_cache_shape = [](const ggml_tensor * tensor, int64_t cache_rows) {
++        return tensor->type == GGML_TYPE_F16 && tensor->ne[0] == 1 &&
++               tensor->ne[1] == 4096 * cache_rows &&
++               tensor->ne[2] == 1 && tensor->ne[3] == 1 && tensor->nb[0] == sizeof(ggml_fp16_t) &&
++               tensor->nb[1] == sizeof(ggml_fp16_t) && ggml_is_contiguous(tensor);
++    };
++
++    const bool v_row_layout = is_flat_row_shape(v_src) && is_cache_shape(v_set) &&
++                              v_set->ne[1] == k_set->ne[1] &&
++                              ggml_nelements(v_indices) == 1;
++    const bool v_scalar_rows_layout = is_scalar_rows_shape(v_src) &&
++                                      is_flat_cache_shape(v_set, k_set->ne[1]) &&
++                                      ggml_nelements(v_indices) == 4096;
++
++    if (!is_qk_shape(q_src) || !is_qk_shape(k_src) || !is_qk_shape(q_rope) ||
++        !is_qk_shape(k_rope) || !is_flat_row_shape(k_view) || !is_cache_shape(k_set) ||
++        (!v_row_layout && !v_scalar_rows_layout)) {
++        return false;
++    }
++    if (pos->type != GGML_TYPE_I32 || ggml_nelements(pos) != 1 ||
++        k_indices->type != GGML_TYPE_I64 || ggml_nelements(k_indices) != 1 ||
++        v_indices->type != GGML_TYPE_I64) {
++        return false;
++    }
++
++    return true;
++}
++
+ // Pattern check for the 5-op Snake fusion: mul -> sin -> sqr -> mul -> add.
+ // Verifies the chain shape, the closure x_in_add == x_in_mul0, and that
+ // the broadcast operands a and inv_b share a [1, C] layout.
+@@ -17437,14 +18095,27 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     ctx->flash_attn_q8_1_exact_shape = 0;
+     ctx->flash_attn_q8_1_route = 0;
+     ctx->flash_attn_q8_1_split2 = 0;
++    ctx->flash_attn_q8_1_masked_split_direct = 0;
+     ctx->flash_attn_q8_1_produced = 0;
+     ctx->flash_attn_q8_1_consumer_cache_hits = 0;
+     ctx->q4_0_mmvq_navi22_dispatches = 0;
++    ctx->q4_0_mmvq_navi22_rows1_dispatches = 0;
++    ctx->q4_0_mmvq_navi22_rows1_down_dispatches = 0;
++    ctx->q4_0_mmvq_navi22_rows1_attention_dispatches = 0;
++    ctx->q4_0_down_prefetch_navi22_dispatches = 0;
++    ctx->f16_attn_p021_navi22_dispatches = 0;
++    ctx->f16_attn_nc_navi22_dispatches = 0;
++    ctx->f16_attn_mmv_navi22_dispatches = 0;
++    ctx->f16_attn_mmv_navi22_qk_dispatches = 0;
++    ctx->f16_attn_mmv_navi22_av_dispatches = 0;
++    ctx->post_qkv_fusion_navi22_dispatches = 0;
+     ctx->q4_0_multiproj_count = 0;
+     ctx->q4_0_multiproj_groups = 0;
+     ctx->q4_0_multiproj_qkv_groups = 0;
+     ctx->q4_0_multiproj_ffn_groups = 0;
++    ctx->q4_0_multiproj_ffn_swiglu_groups = 0;
+     ctx->q4_0_multiproj_logical_dispatches = 0;
++    ctx->q4_0_multiproj_ffn_swiglu = false;
+ 
+     // On weaker AMD GPUs larger submissions can hit a driver timeout, submit more often to avoid this
+     if (ctx->device->vendor_id == VK_VENDOR_ID_AMD && ctx->device->shader_core_count > 0) {
+@@ -17476,16 +18147,27 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+         ctx->fused_topk_moe_scale = false;
+         ctx->q4_0_multiproj_count = 0;
++        ctx->q4_0_multiproj_ffn_swiglu = false;
+         const char *fusion_string {};
+         if (!ctx->device->disable_fusion) {
+             const uint32_t multiproj_count = ggml_vk_q4_0_multiproj_eligible(ctx, cgraph, i);
++            const bool multiproj_ffn_swiglu = multiproj_count == 2 &&
++                ggml_vk_q4_0_multiproj_ffn_swiglu_eligible(ctx, cgraph, i);
+             uint32_t num_adds = ggml_vk_fuse_multi_add(ctx, cgraph, i);
+             if (multiproj_count != 0) {
+                 ctx->q4_0_multiproj_count = multiproj_count;
+-                ctx->num_additional_fused_ops = multiproj_count - 1;
+-                ctx->fused_ops_write_mask = (1u << multiproj_count) - 1;
+-                fusion_string = multiproj_count == 3 ? "Q4_0_MULTIPROJ_QKV" : "Q4_0_MULTIPROJ_FFN";
+-                std::fill_n(op_srcs_fused_elementwise, multiproj_count, false);
++                ctx->q4_0_multiproj_ffn_swiglu = multiproj_ffn_swiglu;
++                if (multiproj_ffn_swiglu) {
++                    ctx->num_additional_fused_ops = multiproj_count;
++                    ctx->fused_ops_write_mask = 1u << multiproj_count;
++                    fusion_string = "Q4_0_MULTIPROJ_FFN_SWIGLU";
++                    std::fill_n(op_srcs_fused_elementwise, multiproj_count + 1, false);
++                } else {
++                    ctx->num_additional_fused_ops = multiproj_count - 1;
++                    ctx->fused_ops_write_mask = (1u << multiproj_count) - 1;
++                    fusion_string = multiproj_count == 3 ? "Q4_0_MULTIPROJ_QKV" : "Q4_0_MULTIPROJ_FFN";
++                    std::fill_n(op_srcs_fused_elementwise, multiproj_count, false);
++                }
+             } else if (num_adds) {
+                 ctx->num_additional_fused_ops = num_adds - 1;
+                 fusion_string = "MULTI_ADD";
+@@ -17556,6 +18238,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 fusion_string = "SSM_CONV_SILU";
+                 op_srcs_fused_elementwise[0] = false;
+                 op_srcs_fused_elementwise[1] = true;
++            } else if (ggml_can_fuse_subgraph(
++                           cgraph,
++                           i,
++                           { GGML_OP_ROPE, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS, GGML_OP_SET_ROWS },
++                           { i, i + 3, i + 4 }) &&
++                       ggml_check_edges(cgraph, i, post_qkv_navi22_edges) &&
++                       ggml_vk_can_fuse_post_qkv_navi22(ctx, cgraph, i)) {
++                ctx->num_additional_fused_ops = 4;
++                ctx->fused_ops_write_mask = (1u << 0) | (1u << 3) | (1u << 4);
++                fusion_string = "ROPE_QKV_SET_ROWS_NAVI22";
++                op_srcs_fused_elementwise[0] = true;
++                op_srcs_fused_elementwise[1] = false;
++                op_srcs_fused_elementwise[2] = false;
++                op_srcs_fused_elementwise[3] = false;
++                // SET_ROWS writes its explicit cache destination in-place. The exact
++                // alias is intentional; partial overlaps remain rejected.
++                op_srcs_fused_elementwise[4] = true;
+             } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, { i + 2 }) &&
+                        ggml_check_edges(cgraph, i, rope_view_set_rows_edges) &&
+                        ggml_vk_can_fuse_rope_set_rows(ctx, cgraph, i)) {
+@@ -17663,6 +18362,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                                     }
+                                 }
+                                 if (!found) {
++                                    if (fusion_string != nullptr &&
++                                        strcmp(fusion_string, "ROPE_QKV_SET_ROWS_NAVI22") == 0) {
++                                        fprintf(
++                                            stderr,
++                                            "ggml_vulkan: post-QKV fusion overlap rejection "
++                                            "dst=%s src=%s fused_op=%d src_slot=%u elementwise=%d "
++                                            "dst_offset=%zu dst_size=%zu src_offset=%zu src_size=%zu\n",
++                                            dst->name,
++                                            src->name,
++                                            k,
++                                            s,
++                                            op_srcs_fused_elementwise[k] ? 1 : 0,
++                                            (size_t)(vk_tensor_offset(dst) + dst->view_offs),
++                                            (size_t)ggml_nbytes(dst),
++                                            (size_t)(vk_tensor_offset(src) + src->view_offs),
++                                            (size_t)ggml_nbytes(src));
++                                    }
+                                     need_disable = true;
+                                 }
+                             }
+@@ -17676,11 +18392,13 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+                 ctx->fused_topk_moe_mode = TOPK_MOE_COUNT;
+                 ctx->fused_topk_moe_scale = false;
+                 ctx->q4_0_multiproj_count = 0;
++                ctx->q4_0_multiproj_ffn_swiglu = false;
+             }
+         }
+ 
+         if (ctx->q4_0_multiproj_count != 0) {
+-            for (uint32_t fused_idx = 1; fused_idx < ctx->q4_0_multiproj_count; ++fused_idx) {
++            const uint32_t fused_count = ctx->q4_0_multiproj_count + ctx->q4_0_multiproj_ffn_swiglu;
++            for (uint32_t fused_idx = 1; fused_idx < fused_count; ++fused_idx) {
+                 const uint64_t node_flops = ggml_vk_get_node_flops(cgraph->nodes[i + fused_idx]);
+                 batch_flops += node_flops;
+                 total_flops += node_flops;
+@@ -17734,6 +18452,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         ctx->num_additional_fused_ops = 0;
+         ctx->fused_ops_write_mask = 0;
+         ctx->q4_0_multiproj_count = 0;
++        ctx->q4_0_multiproj_ffn_swiglu = false;
+     }
+ 
+     ctx->last_total_flops = total_flops;
+@@ -17776,11 +18495,33 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         (!ctx->device->rms_norm_mul_q8_1_navi22 ||
+          ctx->rms_norm_mul_q8_1_direct_dispatches != 0) &&
+         !ctx->device->q4_0_mmvq_navi22_diagnostic_logged.exchange(true)) {
+-        fprintf(
+-            stderr,
+-            "ggml_vulkan: Q4_0 x Q8_1 Navi22 MMVQ coverage "
+-            "(n=1 wave64 rows_per_workgroup=2 dispatches=%u)\n",
+-            ctx->q4_0_mmvq_navi22_dispatches);
++        if (ctx->device->q4_0_mmvq_navi22_rows1_mode != 0) {
++            const char * mode = ctx->device->q4_0_mmvq_navi22_rows1_mode == 1 ? "down" :
++                                ctx->device->q4_0_mmvq_navi22_rows1_mode == 2 ? "attention" : "all";
++            fprintf(
++                stderr,
++                "ggml_vulkan: Q4_0 x Q8_1 Navi22 MMVQ coverage "
++                "(n=1 wave64 rows_mode=mixed2_1 rows1_shape=%s dispatches=%u rows1_dispatches=%u "
++                "rows1_down=%u rows1_attention=%u)\n",
++                mode,
++                ctx->q4_0_mmvq_navi22_dispatches,
++                ctx->q4_0_mmvq_navi22_rows1_dispatches,
++                ctx->q4_0_mmvq_navi22_rows1_down_dispatches,
++                ctx->q4_0_mmvq_navi22_rows1_attention_dispatches);
++            if (ctx->device->q4_0_down_prefetch_navi22) {
++                fprintf(
++                    stderr,
++                    "ggml_vulkan: Q4_0 down-projection next-block-prefetch coverage "
++                    "(lookahead=1 exact_k=11008 dispatches=%u)\n",
++                    ctx->q4_0_down_prefetch_navi22_dispatches);
++            }
++        } else {
++            fprintf(
++                stderr,
++                "ggml_vulkan: Q4_0 x Q8_1 Navi22 MMVQ coverage "
++                "(n=1 wave64 rows_per_workgroup=2 dispatches=%u)\n",
++                ctx->q4_0_mmvq_navi22_dispatches);
++        }
+     }
+ 
+     if (ctx->device->q4_0_multiproj_navi22 &&
+@@ -17791,14 +18532,92 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+         fprintf(
+             stderr,
+             "ggml_vulkan: Q4_0 Navi22 multi-projection coverage "
+-            "(wave64 rows_per_workgroup=2 groups=%u qkv_groups=%u ffn_groups=%u logical_dispatches=%u)\n",
++            "(wave64 qkv_rows_per_workgroup=1 ffn_rows_per_workgroup=2 groups=%u qkv_groups=%u ffn_groups=%u logical_dispatches=%u)\n",
+             ctx->q4_0_multiproj_groups,
+             ctx->q4_0_multiproj_qkv_groups,
+             ctx->q4_0_multiproj_ffn_groups,
+             ctx->q4_0_multiproj_logical_dispatches);
++        if (ctx->q4_0_multiproj_ffn_swiglu_groups != 0) {
++            fprintf(
++                stderr,
++                "ggml_vulkan: Q4_0 Navi22 fused FFN projection+SwiGLU coverage "
++                "(wave64 paired_projections groups=%u logical_projections=%u)\n",
++                ctx->q4_0_multiproj_ffn_swiglu_groups,
++                2 * ctx->q4_0_multiproj_ffn_swiglu_groups);
++        }
++    }
++
++    if (ctx->device->f16_attn_navi22_mode != 0 &&
++        ctx->f16_attn_p021_navi22_dispatches + ctx->f16_attn_nc_navi22_dispatches != 0 &&
++        !ctx->device->f16_attn_navi22_diagnostic_logged.exchange(true)) {
++        const char * mode = ctx->device->f16_attn_navi22_mode == 1 ? "nc" :
++                            ctx->device->f16_attn_navi22_mode == 2 ? "p021" : "both";
++        fprintf(
++            stderr,
++            "ggml_vulkan: F16 attention Navi22 coverage "
++            "(mode=%s wave32 dispatches=%u qk_nc=%u av_p021=%u)\n",
++            mode,
++            ctx->f16_attn_p021_navi22_dispatches + ctx->f16_attn_nc_navi22_dispatches,
++            ctx->f16_attn_nc_navi22_dispatches,
++            ctx->f16_attn_p021_navi22_dispatches);
++    }
++
++    if (ctx->device->f16_attn_mmv_navi22_rows != 0 &&
++        ctx->f16_attn_mmv_navi22_dispatches != 0 &&
++        !ctx->device->f16_attn_mmv_navi22_diagnostic_logged.exchange(true)) {
++        if (ctx->device->f16_attn_mmv_navi22_rows == 8) {
++            fprintf(
++                stderr,
++                "ggml_vulkan: F16 attention MMV Navi22 coverage "
++                "(wave32 rows_per_wave=8 waves_per_workgroup=2 rows_per_workgroup=16 dispatches=%u qk=%u av=%u)\n",
++                ctx->f16_attn_mmv_navi22_dispatches,
++                ctx->f16_attn_mmv_navi22_qk_dispatches,
++                ctx->f16_attn_mmv_navi22_av_dispatches);
++        } else {
++            fprintf(
++                stderr,
++                "ggml_vulkan: F16 attention MMV Navi22 coverage "
++                "(wave32 rows_per_workgroup=%u dispatches=%u qk=%u av=%u)\n",
++                ctx->device->f16_attn_mmv_navi22_rows,
++                ctx->f16_attn_mmv_navi22_dispatches,
++                ctx->f16_attn_mmv_navi22_qk_dispatches,
++                ctx->f16_attn_mmv_navi22_av_dispatches);
++        }
++    }
++
++    if (ctx->device->post_qkv_fusion_navi22 &&
++        ctx->post_qkv_fusion_navi22_dispatches != 0 &&
++        !ctx->device->post_qkv_fusion_navi22_diagnostic_logged.exchange(true)) {
++        fprintf(
++            stderr,
++            "ggml_vulkan: fused Q/K RoPE plus K/V set-rows Navi22 coverage "
++            "(normal128 f32_to_f32_f16 dispatches=%u)\n",
++            ctx->post_qkv_fusion_navi22_dispatches);
+     }
+ 
+-    if (ctx->device->flash_attn_q8_1_navi22 &&
++    if (ctx->device->fa_masked_split_navi22 &&
++        ctx->flash_attn_q8_1_masked_split_direct != 0 &&
++        !ctx->device->fa_masked_split_navi22_diagnostic_logged.exchange(true)) {
++        fprintf(
++            stderr,
++            "ggml_vulkan: masked-split direct FLASH_ATTN_EXT -> Q8_1_x4 Navi22 ACTIVE "
++            "(expected_model_produced=32 structural=%u reshape=%u next_matmul=%u "
++            "activation_match=%u single_consumer=%u exact_q4_0_shape=%u route=%u split2=%u "
++            "masked_split_direct=%u produced=%u consumer_cache_hits=%u "
++            "main_workgroups_per_head=1 omitted_masked_workgroups_per_head=1 "
++            "inline_reducer=1 local_size=128 wave32)\n",
++            ctx->flash_attn_q8_1_structural,
++            ctx->flash_attn_q8_1_reshape,
++            ctx->flash_attn_q8_1_next_matmul,
++            ctx->flash_attn_q8_1_activation_match,
++            ctx->flash_attn_q8_1_single_consumer,
++            ctx->flash_attn_q8_1_exact_shape,
++            ctx->flash_attn_q8_1_route,
++            ctx->flash_attn_q8_1_split2,
++            ctx->flash_attn_q8_1_masked_split_direct,
++            ctx->flash_attn_q8_1_produced,
++            ctx->flash_attn_q8_1_consumer_cache_hits);
++    } else if (ctx->device->flash_attn_q8_1_navi22 &&
+         ctx->flash_attn_q8_1_produced != 0 &&
+         !ctx->device->flash_attn_q8_1_navi22_diagnostic_logged.exchange(true)) {
+         fprintf(
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
+index 3192130cc..9c6a5a5e8 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn.comp
+@@ -196,7 +196,7 @@ void main() {
+ 
+     [[dont_unroll]]
+     for (uint32_t j = start_j; j < end_j; ++j) {
+-        if (MASK_ENABLE) {
++        if (MASK_ENABLE && !CULL_MASK_NEG_INF) {
+             if (USE_MASK_OPT && mask_opt_idx != j / 16) {
+                 mask_opt_idx = j / 16;
+                 mask_opt = data_mask_opt[mo_offset + mask_opt_idx];
+@@ -241,6 +241,19 @@ void main() {
+             }
+         }
+ 
++        // The exact single-row Navi22 decode specialization reads the four
++        // mask values owned by each thread directly. This avoids the shared
++        // mask staging and whole-workgroup classification barriers above; its
++        // per-column -inf cull also handles fully masked tiles without loading
++        // K or V values.
++        FLOAT_TYPE direct_mask[cols_per_thread];
++        if (CULL_MASK_NEG_INF) {
++            [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
++                direct_mask[c] = FLOAT_TYPE(data_m[m_offset + i * Br * m_stride +
++                                                     j * Bc + c * cols_per_iter + col_tid]);
++            }
++        }
++
+         ACC_TYPE Sf[rows_per_thread][cols_per_thread];
+         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+             [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+@@ -303,6 +316,10 @@ void main() {
+                 }
+ 
+                 [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
++                    if (CULL_MASK_NEG_INF && MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO &&
++                        float(direct_mask[c]) <= NEG_FLT_MAX_OVER_2) {
++                        continue;
++                    }
+                     if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
+                         continue;
+                     }
+@@ -325,6 +342,10 @@ void main() {
+             }
+         } else {
+             [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
++                if (CULL_MASK_NEG_INF && MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO &&
++                    float(direct_mask[c]) <= NEG_FLT_MAX_OVER_2) {
++                    continue;
++                }
+                 if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
+                     continue;
+                 }
+@@ -354,6 +375,10 @@ void main() {
+                                 (hsk4 % 2 == 0) ? 2 : 1;
+ 
+         [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
++            if (CULL_MASK_NEG_INF && MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO &&
++                float(direct_mask[c]) <= NEG_FLT_MAX_OVER_2) {
++                continue;
++            }
+             if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
+                 continue;
+             }
+@@ -447,7 +472,8 @@ void main() {
+         if (MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO) {
+             [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
+                 [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+-                    FLOAT_TYPE mvf = masksh[(c * cols_per_iter + col_tid) * masksh_stride + tile_row(r)];
++                    FLOAT_TYPE mvf = CULL_MASK_NEG_INF ? direct_mask[c] :
++                        masksh[(c * cols_per_iter + col_tid) * masksh_stride + tile_row(r)];
+ 
+                     Sf[r][c] += slope[r]*mvf;
+                 }
+@@ -505,6 +531,10 @@ void main() {
+         }
+ 
+         [[unroll]] for (uint32_t c = 0; c < cols_per_thread; ++c) {
++            if (CULL_MASK_NEG_INF && MASK_ENABLE && mask_opt_bits != MASK_OPT_ALL_ZERO &&
++                float(direct_mask[c]) <= NEG_FLT_MAX_OVER_2) {
++                continue;
++            }
+             if (KV_bounds_check && j * Bc + c * cols_per_iter + col_tid >= KV) {
+                 continue;
+             }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl
+index 66dcf6102..7ac279a45 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_base.glsl
+@@ -24,6 +24,7 @@ const bool USE_MASK_OPT    = (Flags & 1) != 0;
+ const bool MASK_ENABLE     = (Flags & 2) != 0;
+ const bool LOGIT_SOFTCAP   = (Flags & 4) != 0;
+ const bool OLD_AMD_WINDOWS = (Flags & 8) != 0;
++const bool CULL_MASK_NEG_INF = (Flags & 16) != 0;
+ 
+ // Round up head sizes to a multiple of 16, for coopmat1/coopmat2 paths
+ const uint32_t HSK_pad = (HSK + 15) & ~15;
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_decode_f16_navi22.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_decode_f16_navi22.comp
+new file mode 100644
+index 000000000..148597c26
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_decode_f16_navi22.comp
+@@ -0,0 +1,292 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : enable
++#extension GL_EXT_shader_16bit_storage : require
++#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
++#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
++#extension GL_EXT_shader_subgroup_extended_types_float16 : require
++#extension GL_KHR_shader_subgroup_shuffle : enable
++#extension GL_KHR_shader_subgroup_vote : enable
++#extension GL_KHR_shader_subgroup_arithmetic : require
++#extension GL_KHR_shader_subgroup_clustered : require
++
++#include "dot_product_funcs.glsl"
++#include "types.glsl"
++
++// Exact Llama 2 7B decode path:
++// N=1, KV=256, 32 heads, HSK=HSV=128, F32 Q, F16 K/V/mask,
++// split-k=2, Bc=64, D_split=8, wave32, workgroup=128. Decode positions
++// 0..127 make the second physical split entirely -inf. Detect and omit that
++// split, while retaining a correctness fallback for arbitrary finite masks,
++// then reproduce the split-2 reducer and fused Q8_1_x4 arithmetic in-place.
++// The arithmetic and reduction order mirror flash_attn.comp followed by
++// flash_attn_split_k_reduce_q8_1_x4_navi22.comp for this exact shape.
++layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
++
++layout(binding = 0) readonly buffer QV4 { vec4 data_qv4[]; };
++layout(binding = 1) readonly buffer KV4 { f16vec4 data_kv4[]; };
++layout(binding = 2) readonly buffer VV4 { f16vec4 data_vv4[]; };
++layout(binding = 3) readonly buffer M { float16_t data_m[]; };
++layout(binding = 4) writeonly buffer O { float data_o[]; };
++layout(binding = 5, std430) writeonly buffer Q8Buf { block_q8_1_x4 data_q8[]; };
++
++layout(push_constant) uniform parameter {
++    uint32_t N;
++    uint32_t KV;
++
++    uint32_t ne1;
++    uint32_t ne2;
++    uint32_t ne3;
++
++    uint32_t neq2;
++    uint32_t neq3;
++    uint32_t nek2;
++    uint32_t nek3;
++    uint32_t nev2;
++    uint32_t nev3;
++    uint32_t nem1;
++    uint32_t nem2;
++    uint32_t nem3;
++
++    uint32_t nb01;
++    uint32_t nb02;
++    uint32_t nb03;
++    uint32_t nb11;
++    uint32_t nb12;
++    uint32_t nb13;
++    uint32_t nb21;
++    uint32_t nb22;
++    uint32_t nb23;
++
++    float scale;
++    float max_bias;
++    float logit_softcap;
++
++    uint32_t mask_n_head_log2;
++    float m0;
++    float m1;
++
++    uint32_t gqa_ratio;
++    uint32_t split_kv;
++    uint32_t k_num;
++} p;
++
++shared f16vec4 Qf[33];
++shared float tmpsh[32];
++shared float tmpLf[32];
++shared f16vec4 tmpshv4[4][32];
++shared uint32_t active_waves[4];
++
++void main() {
++    const uint32_t tid = gl_LocalInvocationIndex;
++    const uint32_t d_tid = tid & 7u;
++    const uint32_t col_tid = tid >> 3u;
++    const uint32_t iq2 = gl_WorkGroupID.y;
++
++    const uint32_t q_head_vec4 = iq2 * p.nb02 / 16u;
++    if (tid < 32u) {
++        Qf[tid] = f16vec4(data_qv4[q_head_vec4 + tid] * p.scale);
++    }
++    barrier();
++
++    const uint32_t k_head_vec4 = iq2 * p.nb12 / 8u;
++    const uint32_t v_head_vec4 = iq2 * p.nb22 / 8u;
++    const uint32_t k_stride_vec4 = p.nb11 / 4u;
++    const uint32_t v_stride_vec4 = p.nb21 / 4u;
++
++    const float NEG_FLT_MAX_OVER_2 = uintBitsToFloat(0xFEFFFFFF);
++    const float FATTN_KQ_MAX_OFFSET = 3.0f * 0.6931f;
++    f16vec4 split_Of[2][4];
++    float split_Lf[2];
++    float split_Mf[2];
++
++    [[unroll]] for (uint32_t split = 0u; split < 2u; ++split) {
++        bool split_active = true;
++        if (split == 1u) {
++            const bool lane_active = float(data_m[128u + tid]) > NEG_FLT_MAX_OVER_2;
++            const bool wave_active = subgroupAny(lane_active);
++            if (gl_SubgroupInvocationID == 0u) {
++                active_waves[gl_SubgroupID] = wave_active ? 1u : 0u;
++            }
++            barrier();
++            split_active = active_waves[0] != 0u || active_waves[1] != 0u ||
++                           active_waves[2] != 0u || active_waves[3] != 0u;
++        }
++
++        f16vec4 Of[4];
++        [[unroll]] for (uint32_t d = 0; d < 4u; ++d) {
++            Of[d] = f16vec4(0.0);
++        }
++        float Lf = 0.0;
++        float Mf = NEG_FLT_MAX_OVER_2;
++
++        if (split_active) {
++    [[unroll]] for (uint32_t j = split * 2u; j < split * 2u + 2u; ++j) {
++        float16_t direct_mask[4];
++        [[unroll]] for (uint32_t c = 0; c < 4u; ++c) {
++            direct_mask[c] = data_m[j * 64u + c * 16u + col_tid];
++        }
++
++        float Sf[4];
++        [[unroll]] for (uint32_t c = 0; c < 4u; ++c) {
++            Sf[c] = 0.0;
++        }
++
++        [[unroll]] for (uint32_t c = 0; c < 4u; ++c) {
++            if (float(direct_mask[c]) <= NEG_FLT_MAX_OVER_2) {
++                continue;
++            }
++            const uint32_t key = j * 64u + c * 16u + col_tid;
++            [[unroll]] for (uint32_t d = 0; d < 4u; ++d) {
++                const f16vec4 K_Tf = data_kv4[k_head_vec4 + key * k_stride_vec4 + d * 8u + d_tid];
++                Sf[c] = dot_product(Qf[d * 8u + d_tid], K_Tf, Sf[c]);
++            }
++        }
++
++        [[unroll]] for (uint32_t c = 0; c < 4u; ++c) {
++            [[unroll]] for (uint32_t s = 4u; s > 0u; s >>= 1u) {
++                Sf[c] += subgroupShuffleXor(Sf[c], s);
++            }
++            Sf[c] += float(direct_mask[c]);
++        }
++
++        float rowmaxf = NEG_FLT_MAX_OVER_2;
++        [[unroll]] for (uint32_t c = 0; c < 4u; ++c) {
++            rowmaxf = max(rowmaxf, Sf[c]);
++        }
++        rowmaxf += FATTN_KQ_MAX_OFFSET;
++
++        const float Moldf = Mf;
++        Mf = max(rowmaxf, Moldf);
++        const float eMf = exp(Moldf - Mf);
++        Lf = eMf * Lf;
++
++        [[unroll]] for (uint32_t d = 0; d < 4u; ++d) {
++            Of[d] = float16_t(eMf) * Of[d];
++        }
++
++        [[unroll]] for (uint32_t c = 0; c < 4u; ++c) {
++            if (float(direct_mask[c]) <= NEG_FLT_MAX_OVER_2) {
++                continue;
++            }
++            const float16_t Pf = float16_t(exp(Sf[c] - Mf));
++            Lf += Pf;
++            const uint32_t key = j * 64u + c * 16u + col_tid;
++            [[unroll]] for (uint32_t d = 0; d < 4u; ++d) {
++                const f16vec4 Vf = data_vv4[v_head_vec4 + key * v_stride_vec4 + d * 8u + d_tid];
++                Of[d] += f16vec4(Pf * Vf);
++            }
++        }
++    }
++
++    // Preserve the generic scalar path's wave32-then-workgroup reduction tree.
++    float rowmaxf = Mf;
++    [[unroll]] for (uint32_t s = 8u; s < 32u; s *= 2u) {
++        rowmaxf = max(rowmaxf, subgroupShuffleXor(rowmaxf, s));
++    }
++    if (gl_SubgroupInvocationID == d_tid) {
++        tmpsh[gl_SubgroupID * 8u + d_tid] = rowmaxf;
++    }
++    barrier();
++    rowmaxf = tmpsh[d_tid];
++    [[unroll]] for (uint32_t s = 1u; s < 4u; ++s) {
++        rowmaxf = max(rowmaxf, tmpsh[s * 8u + d_tid]);
++    }
++
++    const float Moldf = Mf;
++    Mf = max(rowmaxf, Moldf);
++    const float eMf = exp(Moldf - Mf);
++    Lf = eMf * Lf;
++
++    [[unroll]] for (uint32_t s = 8u; s < 32u; s *= 2u) {
++        Lf += subgroupShuffleXor(Lf, s);
++    }
++
++    [[unroll]] for (uint32_t d = 0; d < 4u; ++d) {
++        Of[d] = float16_t(eMf) * Of[d];
++        [[unroll]] for (uint32_t s = 8u; s < 32u; s *= 2u) {
++            Of[d] += subgroupShuffleXor(Of[d], s);
++        }
++    }
++
++    // L and the four independent O vectors have identical cross-wave
++    // reduction geometry.  Publish all five wave partials to scratch that is
++    // disjoint from the max and split-activity scratch.  The distinct regions
++    // eliminate reuse-only barriers while the one producer/consumer barrier
++    // and every per-value addition remain unchanged.
++    if (gl_SubgroupInvocationID == d_tid) {
++        const uint32_t partial = gl_SubgroupID * 8u + d_tid;
++        tmpLf[partial] = Lf;
++        [[unroll]] for (uint32_t d = 0; d < 4u; ++d) {
++            tmpshv4[d][partial] = Of[d];
++        }
++    }
++    barrier();
++
++    Lf = tmpLf[d_tid];
++    [[unroll]] for (uint32_t s = 1u; s < 4u; ++s) {
++        Lf += tmpLf[s * 8u + d_tid];
++    }
++
++    [[unroll]] for (uint32_t d = 0; d < 4u; ++d) {
++        Of[d] = tmpshv4[d][d_tid];
++        [[unroll]] for (uint32_t s = 1u; s < 4u; ++s) {
++            Of[d] += tmpshv4[d][s * 8u + d_tid];
++        }
++    }
++
++        }
++        [[unroll]] for (uint32_t d = 0; d < 4u; ++d) {
++            split_Of[split][d] = Of[d];
++        }
++        split_Lf[split] = Lf;
++        split_Mf[split] = Mf;
++    }
++
++    // Reproduce the retained split-2 reducer literally. A dynamically omitted
++    // split retains M=-FLT_MAX/2, L=0, and O=0. Every lane has the same reduced
++    // M/L values, so the output wave can compute these scalars directly and
++    // avoid a shared-memory broadcast and workgroup barrier.
++    if (tid < 32u) {
++        const float m0 = split_Mf[0];
++        const float m1 = split_Mf[1];
++        const float m_max = max(m0, m1);
++        const float e0 = exp(m0 - m_max);
++        const float e1 = exp(m1 - m_max);
++        const float L = e0 * split_Lf[0] + e1 * split_Lf[1];
++        const float inv_L = L == 0.0 ? 0.0 : 1.0 / L;
++        const uint32_t block = col_tid;
++        const uint32_t iqs = d_tid;
++        const uint32_t d_base = block * 32u + iqs * 4u;
++        const vec4 vals0 = vec4(split_Of[0][block]);
++        const vec4 vals1 = vec4(split_Of[1][block]);
++        vec4 vals;
++
++        [[unroll]] for (uint32_t j = 0u; j < 4u; ++j) {
++            float O = 0.0;
++            O += e0 * vals0[j];
++            O += e1 * vals1[j];
++            O *= inv_L;
++
++            const float FLT_MAX = uintBitsToFloat(0x7F7FFFFF);
++            O = clamp(O, -FLT_MAX, FLT_MAX);
++            data_o[iq2 * 128u + d_base + j] = O;
++            vals[j] = O;
++        }
++
++        const vec4 abs_vals = abs(vals);
++        const float thread_max = max(max(abs_vals.x, abs_vals.y), max(abs_vals.z, abs_vals.w));
++        const float amax = subgroupClusteredMax(thread_max, 8);
++        const float qd = amax / 127.0;
++        const float d_inv = qd != 0.0 ? 1.0 / qd : 0.0;
++        vals = round(vals * d_inv);
++
++        data_q8[iq2].qs[block * 8u + iqs] = pack32(i8vec4(vals));
++
++        const float thread_sum = vals.x + vals.y + vals.z + vals.w;
++        const float qsum = subgroupClusteredAdd(thread_sum, 8);
++        if (iqs == 0u) {
++            data_q8[iq2].ds[block] = f16vec2(vec2(qd, qsum * qd));
++        }
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_split_k_reduce_q8_1_x4_navi22.comp b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_split_k_reduce_q8_1_x4_navi22.comp
+index f7fab18c3..293786b4f 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_split_k_reduce_q8_1_x4_navi22.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/flash_attn_split_k_reduce_q8_1_x4_navi22.comp
+@@ -83,7 +83,7 @@ void main() {
+     vals = round(vals * d_inv);
+ 
+     const uint q8_outer = (i3 * p.ne2 + i2) * p.ne1 + n;
+-    data_q8[q8_outer].qs[block * 8 + iqs] = pack32(i8vec4(round(vals)));
++    data_q8[q8_outer].qs[block * 8 + iqs] = pack32(i8vec4(vals));
+ 
+     const float thread_sum = vals.x + vals.y + vals.z + vals.w;
+     const float qsum = subgroupClusteredAdd(thread_sum, 8);
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_av_rows16_navi22.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_av_rows16_navi22.comp
+new file mode 100644
+index 000000000..3eecfba3b
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_av_rows16_navi22.comp
+@@ -0,0 +1,51 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : enable
++#extension GL_KHR_shader_subgroup_arithmetic : require
++#extension GL_KHR_shader_subgroup_basic : require
++
++#include "types.glsl"
++
++layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A { float16_t data_a[]; };
++layout (binding = 0) readonly buffer A_VEC4 { f16vec4 data_a_vec4[]; };
++layout (binding = 1) readonly buffer B { float data_b[]; };
++layout (binding = 1) readonly buffer B_VEC4 { vec4 data_b_vec4[]; };
++layout (binding = 2) writeonly buffer D { float data_d[]; };
++
++layout (push_constant) uniform parameter {
++    uint ncols_x;
++    uint nrows_x;
++    uint nchannels_x;
++    uint nchannels_y;
++    uint b_offset;
++    uint d_offset;
++    uint fusion_flags;
++} p;
++
++void main() {
++    const uint lane = gl_LocalInvocationID.x;
++    const uint first_row = 16 * gl_WorkGroupID.y;
++    const uint channel = gl_WorkGroupID.z;
++    const uint col = 4 * lane;
++    const vec4 b = data_b_vec4[(channel * 128 + col) / 4];
++
++    [[unroll]] for (uint batch = 0; batch < 4; ++batch) {
++        float values[4];
++        [[unroll]] for (uint local_row = 0; local_row < 4; ++local_row) {
++            const uint row = 4 * batch + local_row;
++            const uint ix = (first_row + row) * 4096 + channel * 128 + col;
++            const vec4 a = vec4(data_a_vec4[ix / 4]);
++            values[local_row] = subgroupAdd(dot(a, b));
++        }
++
++        if (lane == 0) {
++            [[unroll]] for (uint local_row = 0; local_row < 4; ++local_row) {
++                const uint row = 4 * batch + local_row;
++                const uint idst = channel * 256 + first_row + row;
++                data_d[idst] = values[local_row];
++            }
++        }
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_av_rows32_dualwave_navi22.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_av_rows32_dualwave_navi22.comp
+new file mode 100644
+index 000000000..217e016b4
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_av_rows32_dualwave_navi22.comp
+@@ -0,0 +1,60 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : enable
++#extension GL_KHR_shader_subgroup_arithmetic : require
++#extension GL_KHR_shader_subgroup_basic : require
++
++#include "types.glsl"
++
++layout(local_size_x = 32, local_size_y = 2, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A { float16_t data_a[]; };
++layout (binding = 0) readonly buffer A_VEC4 { f16vec4 data_a_vec4[]; };
++layout (binding = 1) readonly buffer B { float data_b[]; };
++layout (binding = 1) readonly buffer B_VEC4 { vec4 data_b_vec4[]; };
++layout (binding = 2) writeonly buffer D { float data_d[]; };
++
++layout (push_constant) uniform parameter {
++    uint ncols_x;
++    uint nrows_x;
++    uint nchannels_x;
++    uint nchannels_y;
++    uint b_offset;
++    uint d_offset;
++    uint fusion_flags;
++} p;
++
++shared vec4 b_shared[32];
++
++void main() {
++    const uint lane = gl_LocalInvocationID.x;
++    const uint wave = gl_LocalInvocationID.y;
++    const uint channel = gl_WorkGroupID.z;
++
++    if (wave == 0) {
++        b_shared[lane] = data_b_vec4[channel * 32 + lane];
++    }
++    barrier();
++
++    const uint first_row = 32 * gl_WorkGroupID.y + 16 * wave;
++    const uint col = 4 * lane;
++    const vec4 b = b_shared[lane];
++
++    [[unroll]] for (uint batch = 0; batch < 4; ++batch) {
++        float values[4];
++        [[unroll]] for (uint local_row = 0; local_row < 4; ++local_row) {
++            const uint row = 4 * batch + local_row;
++            const uint ix = (first_row + row) * 4096 + channel * 128 + col;
++            const vec4 a = vec4(data_a_vec4[ix / 4]);
++            values[local_row] = subgroupAdd(dot(a, b));
++        }
++
++        if (lane == 0) {
++            [[unroll]] for (uint local_row = 0; local_row < 4; ++local_row) {
++                const uint row = 4 * batch + local_row;
++                const uint idst = channel * 256 + first_row + row;
++                data_d[idst] = values[local_row];
++            }
++        }
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_av_rows8_navi22.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_av_rows8_navi22.comp
+new file mode 100644
+index 000000000..71ae25be9
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_av_rows8_navi22.comp
+@@ -0,0 +1,58 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : enable
++#extension GL_KHR_shader_subgroup_arithmetic : require
++#extension GL_KHR_shader_subgroup_basic : require
++
++#include "types.glsl"
++
++#define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
++#define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
++
++layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A { float16_t data_a[]; };
++layout (binding = 0) readonly buffer A_VEC4 { f16vec4 data_a_vec4[]; };
++layout (binding = 1) readonly buffer B { float data_b[]; };
++layout (binding = 1) readonly buffer B_VEC4 { vec4 data_b_vec4[]; };
++layout (binding = 2) writeonly buffer D { float data_d[]; };
++layout (binding = 3) readonly buffer Fuse0 { float data_fuse0[]; };
++layout (binding = 4) readonly buffer Fuse1 { float data_fuse1[]; };
++
++layout (push_constant) uniform parameter {
++    uint ncols_x;
++    uint nrows_x;
++    uint nchannels_x;
++    uint nchannels_y;
++    uint b_offset;
++    uint d_offset;
++    uint fusion_flags;
++} p;
++
++void main() {
++    const uint lane = gl_LocalInvocationID.x;
++    const uint first_row = 8 * gl_WorkGroupID.y;
++    const uint channel = gl_WorkGroupID.z;
++    const uint col = 4 * lane;
++    const vec4 b = data_b_vec4[(channel * 128 + col) / 4];
++
++    float values[8];
++    [[unroll]] for (uint row = 0; row < 8; ++row) {
++        const uint ix = (first_row + row) * 4096 + channel * 128 + col;
++        const vec4 a = vec4(data_a_vec4[ix / 4]);
++        values[row] = subgroupAdd(dot(a, b));
++    }
++
++    if (lane == 0) {
++        [[unroll]] for (uint row = 0; row < 8; ++row) {
++            const uint idst = channel * 256 + first_row + row;
++            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
++                values[row] += data_fuse0[idst];
++            }
++            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
++                values[row] += data_fuse1[idst];
++            }
++            data_d[idst] = values[row];
++        }
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_qk_rows16_dualwave_navi22.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_qk_rows16_dualwave_navi22.comp
+new file mode 100644
+index 000000000..262793d5e
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_f16_attn_qk_rows16_dualwave_navi22.comp
+@@ -0,0 +1,92 @@
++#version 450
++
++#extension GL_EXT_control_flow_attributes : enable
++#extension GL_KHR_shader_subgroup_arithmetic : require
++#extension GL_KHR_shader_subgroup_basic : require
++
++#include "types.glsl"
++
++layout(local_size_x = 32, local_size_y = 2, local_size_z = 1) in;
++
++layout (binding = 0) readonly buffer A_VEC4 { f16vec4 data_a_vec4[]; };
++layout (binding = 1) readonly buffer B_VEC4 { vec4 data_b_vec4[]; };
++layout (binding = 2) writeonly buffer D { float data_d[]; };
++layout (binding = 3) readonly buffer Fuse0 { float data_fuse0[]; };
++layout (binding = 4) readonly buffer Fuse1 { float data_fuse1[]; };
++
++layout (push_constant) uniform parameter {
++    uint ncols;
++    uint stride_a;
++    uint stride_b;
++    uint stride_d;
++    uint batch_stride_a;
++    uint batch_stride_b;
++    uint batch_stride_d;
++    uint fusion_flags;
++    uint base_work_group_y;
++    uint ne02;
++    uint ne12;
++    uint broadcast2;
++    uint broadcast3;
++} p;
++
++#define MAT_VEC_FUSION_FLAGS_BIAS0 0x1
++#define MAT_VEC_FUSION_FLAGS_BIAS1 0x2
++
++shared vec4 b_shared[64];
++
++void main() {
++    const uint lane = gl_LocalInvocationID.x;
++    const uint wave = gl_LocalInvocationID.y;
++    const uint batch_idx = gl_WorkGroupID.y + p.base_work_group_y;
++
++    uint batch_idx_a = 0;
++    if (batch_idx != 0) {
++        const uint i13 = batch_idx / p.ne12;
++        const uint i12 = batch_idx % p.ne12;
++        const uint i03 = i13 / p.broadcast3;
++        const uint i02 = i12 / p.broadcast2;
++        batch_idx_a = i03 * p.ne02 + i02;
++    }
++
++    const uint a_offset = batch_idx_a * p.batch_stride_a;
++    const uint b_offset = batch_idx * p.batch_stride_b;
++    const uint d_offset = batch_idx * p.batch_stride_d;
++
++    if (wave == 0) {
++        b_shared[lane] = data_b_vec4[b_offset / 4 + lane];
++        b_shared[32 + lane] = data_b_vec4[b_offset / 4 + 32 + lane];
++    }
++    barrier();
++
++    const uint first_row = 16 * gl_WorkGroupID.x + 8 * wave;
++    const uint col = 4 * lane;
++    const vec4 b0 = b_shared[lane];
++    const vec4 b1 = b_shared[32 + lane];
++
++    float values[8];
++    [[unroll]] for (uint row = 0; row < 8; ++row) {
++        const uint ix = a_offset + (first_row + row) * p.ncols + col;
++        values[row] = dot(vec4(data_a_vec4[ix / 4]), b0);
++    }
++    [[unroll]] for (uint row = 0; row < 8; ++row) {
++        const uint ix = a_offset + (first_row + row) * p.ncols + 128 + col;
++        values[row] += dot(vec4(data_a_vec4[ix / 4]), b1);
++    }
++    [[unroll]] for (uint row = 0; row < 8; ++row) {
++        values[row] = subgroupAdd(values[row]);
++    }
++
++    if (lane == 0) {
++        [[unroll]] for (uint row = 0; row < 8; ++row) {
++            float value = values[row];
++            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
++                value += data_fuse0[d_offset + first_row + row];
++            }
++            if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
++                value += data_fuse1[d_offset + first_row + row];
++            }
++            data_d[d_offset + first_row + row] = value;
++        }
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_nc.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_nc.comp
+index beea52962..695a2dfc3 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_nc.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_nc.comp
+@@ -2,6 +2,9 @@
+ 
+ #extension GL_EXT_control_flow_attributes : enable
+ #extension GL_EXT_shader_16bit_storage : require
++#if USE_SUBGROUP_ADD
++#extension GL_KHR_shader_subgroup_arithmetic : require
++#endif
+ 
+ #define BLOCK_SIZE 32
+ #define FLOAT_TYPE float
+@@ -27,7 +30,9 @@ layout (push_constant) uniform parameter
+     uint fusion_flags;
+ } p;
+ 
++#if !USE_SUBGROUP_ADD
+ shared FLOAT_TYPE tmp[BLOCK_SIZE];
++#endif
+ 
+ void main() {
+     const uint tid       = gl_LocalInvocationID.x;
+@@ -101,6 +106,9 @@ void main() {
+         }
+     }
+ 
++#if USE_SUBGROUP_ADD
++    temp = subgroupAdd(temp);
++#else
+     tmp[tid] = temp;
+ 
+     // sum up partial sums and write back result
+@@ -111,14 +119,16 @@ void main() {
+         }
+         barrier();
+     }
++    temp = tmp[tid];
++#endif
+ 
+     if (tid == 0) {
+         if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS0) != 0) {
+-            tmp[0] += FLOAT_TYPE(data_fuse0[idst]);
++            temp += FLOAT_TYPE(data_fuse0[idst]);
+         }
+         if ((p.fusion_flags & MAT_VEC_FUSION_FLAGS_BIAS1) != 0) {
+-            tmp[0] += FLOAT_TYPE(data_fuse1[idst]);
++            temp += FLOAT_TYPE(data_fuse1[idst]);
+         }
+-        data_d[idst] = tmp[0];
++        data_d[idst] = temp;
+     }
+ }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_0_multiproj_navi22.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_0_multiproj_navi22.comp
+index 3dc1b37d1..87fab2e12 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_0_multiproj_navi22.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vec_q4_0_multiproj_navi22.comp
+@@ -31,7 +31,21 @@ layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+ 
+ #define K_PER_ITER 8
+ #define BLOCK_SIZE 64
++#ifndef NUM_ROWS
+ #define NUM_ROWS 2
++#endif
++
++#if defined(NAVI22_STATIC_NCOLS)
++#define MMVQ_NCOLS uint(NAVI22_STATIC_NCOLS)
++#else
++#define MMVQ_NCOLS p.ncols
++#endif
++
++#if defined(NAVI22_STATIC_NROWS)
++#define MMVQ_NROWS uint(NAVI22_STATIC_NROWS)
++#else
++#define MMVQ_NROWS p.nrows
++#endif
+ 
+ int32_t cache_b_qs[K_PER_ITER / 4];
+ vec2 cache_b_ds;
+@@ -63,34 +77,181 @@ void iter(
+         const uint a_block_offset,
+         const uint first_row,
+         const uint num_rows,
+-        const uint col,
++        const uint col_or_block,
+         const uint b_qs_idx) {
++#if defined(NAVI22_STATIC_NCOLS)
++    const uint block_col = col_or_block;
++    const uint b_block_idx = block_col;
++#else
++    const uint col = col_or_block;
+     const uint b_block_idx = col / QUANT_K_Q8_1;
++#endif
+     const uint b_block_idx_outer = b_block_idx / 4;
+     const uint b_block_idx_inner = b_block_idx % 4;
+     cache_b_ds = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
+     cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx];
+     cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx + 4];
+ 
+-    uint ibi = first_row * p.ncols;
++    uint ibi = first_row * MMVQ_NCOLS;
+     [[unroll]] for (uint row = 0; row < num_rows; ++row) {
++#if defined(NAVI22_STATIC_NCOLS)
++        const uint a_block_idx = (first_row + row) * (MMVQ_NCOLS / QUANT_K_Q8_1) +
++                                 block_col + a_block_offset;
++#else
+         const uint a_block_idx = (ibi + col) / QUANT_K_Q8_1 + a_block_offset;
+-        ibi += p.ncols;
++#endif
++        ibi += MMVQ_NCOLS;
+         temp[row] += mmvq_dot_product(a_block_idx, b_qs_idx);
+     }
+ }
+ 
++#if defined(NAVI22_FFN_SWIGLU_FUSED)
++float swiglu(const float a, const float b) {
++    return a / (1.0f + exp(-a)) * b;
++}
++
++void iter_ffn_rows1(
++        inout float temp0,
++        inout float temp1,
++        const uint first_row,
++        const uint block_col,
++        const uint b_qs_idx) {
++    const uint b_block_idx_outer = block_col / 4;
++    const uint b_block_idx_inner = block_col % 4;
++    cache_b_ds = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
++    cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx];
++    cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx + 4];
++
++    const uint row_block_idx = first_row * (MMVQ_NCOLS / QUANT_K_Q8_1) + block_col;
++    temp0 += mmvq_dot_product(row_block_idx + p.a_block_offset0, b_qs_idx);
++    temp1 += mmvq_dot_product(row_block_idx + p.a_block_offset1, b_qs_idx);
++}
++
++void main() {
++    const uint first_row = gl_WorkGroupID.x;
++    const uint tid = gl_LocalInvocationID.x;
++    float temp0 = 0.0f;
++    float temp1 = 0.0f;
++
++    const uint col_stride = K_PER_ITER * BLOCK_SIZE;
++    const uint b_qs_idx = tid % (32 / K_PER_ITER);
++    uint block_col = tid / (QUANT_K_Q8_1 / K_PER_ITER);
++    [[unroll]] for (uint k = 0; k < 8; ++k) {
++        iter_ffn_rows1(temp0, temp1, first_row, block_col, b_qs_idx);
++        block_col += col_stride / QUANT_K_Q8_1;
++    }
++
++    temp0 = subgroupAdd(temp0);
++    temp1 = subgroupAdd(temp1);
++    if (gl_SubgroupInvocationID == 0) {
++        data_d2[first_row] = swiglu(temp0, temp1);
++    }
++}
++#elif defined(NAVI22_QKV_SHARED_ACTIVATION)
++void iter_qkv_shared(
++        inout float temp[3],
++        const uint first_row,
++        const uint col_or_block,
++        const uint b_qs_idx) {
++#if defined(NAVI22_STATIC_NCOLS)
++    const uint block_col = col_or_block;
++    const uint b_block_idx = block_col;
++#else
++    const uint col = col_or_block;
++    const uint b_block_idx = col / QUANT_K_Q8_1;
++#endif
++    const uint b_block_idx_outer = b_block_idx / 4;
++    const uint b_block_idx_inner = b_block_idx % 4;
++    cache_b_ds = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
++    cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx];
++    cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx + 4];
++
++    const uint row_block_idx = first_row * (MMVQ_NCOLS / QUANT_K_Q8_1) +
++#if defined(NAVI22_STATIC_NCOLS)
++                               block_col;
++#else
++                               col / QUANT_K_Q8_1;
++#endif
++    temp[0] += mmvq_dot_product(row_block_idx + p.a_block_offset0, b_qs_idx);
++    temp[1] += mmvq_dot_product(row_block_idx + p.a_block_offset1, b_qs_idx);
++    temp[2] += mmvq_dot_product(row_block_idx + p.a_block_offset2, b_qs_idx);
++}
++
++void main() {
++    const uint first_row = gl_WorkGroupID.x;
++#if !defined(NAVI22_STATIC_FULL_ROWS)
++    if (first_row >= MMVQ_NROWS || p.projection_count != 3) {
++        return;
++    }
++#endif
++    const uint tid = gl_LocalInvocationID.x;
++    float temp[3] = float[3](0.0f, 0.0f, 0.0f);
++
++    const uint col_stride = K_PER_ITER * BLOCK_SIZE;
++#if !defined(NAVI22_STATIC_NCOLS)
++    uint num_iters = MMVQ_NCOLS / col_stride;
++    if (num_iters * col_stride + K_PER_ITER * tid < MMVQ_NCOLS) {
++        num_iters++;
++    }
++#endif
++
++    const uint b_qs_idx = tid % (32 / K_PER_ITER);
++#if defined(NAVI22_STATIC_NCOLS)
++    uint block_col = tid / (QUANT_K_Q8_1 / K_PER_ITER);
++#else
++    uint col = tid * K_PER_ITER;
++#endif
++#if defined(NAVI22_STATIC_NCOLS)
++    [[unroll]] for (uint k = 0; k < 8; ++k) {
++        iter_qkv_shared(temp, first_row, block_col, b_qs_idx);
++        block_col += col_stride / QUANT_K_Q8_1;
++    }
++#else
++    while (num_iters >= 4) {
++        [[unroll]] for (uint k = 0; k < 4; ++k) {
++            iter_qkv_shared(temp, first_row, col, b_qs_idx);
++            col += col_stride;
++        }
++        num_iters -= 4;
++    }
++    if (num_iters >= 2) {
++        iter_qkv_shared(temp, first_row, col, b_qs_idx);
++        col += col_stride;
++        iter_qkv_shared(temp, first_row, col, b_qs_idx);
++        col += col_stride;
++        num_iters -= 2;
++    }
++    if (num_iters > 0) {
++        iter_qkv_shared(temp, first_row, col, b_qs_idx);
++    }
++#endif
++
++    temp[0] = subgroupAdd(temp[0]);
++    temp[1] = subgroupAdd(temp[1]);
++    temp[2] = subgroupAdd(temp[2]);
++    if (gl_SubgroupInvocationID == 0) {
++        store_output(0, first_row, temp[0]);
++        store_output(1, first_row, temp[1]);
++        store_output(2, first_row, temp[2]);
++    }
++}
++#else
+ void main() {
+     const uint projection = gl_WorkGroupID.y;
++#if !defined(NAVI22_STATIC_FULL_ROWS)
+     if (projection >= p.projection_count) {
+         return;
+     }
+ 
+     const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
+-    if (first_row >= p.nrows) {
++    if (first_row >= MMVQ_NROWS) {
+         return;
+     }
+-    const uint num_rows = min(uint(NUM_ROWS), p.nrows - first_row);
++    const uint num_rows = min(uint(NUM_ROWS), MMVQ_NROWS - first_row);
++#else
++    const uint first_row = NUM_ROWS * gl_WorkGroupID.x;
++    const uint num_rows = uint(NUM_ROWS);
++#endif
+     const uint tid = gl_LocalInvocationID.x;
+     const uint a_block_offset = projection_a_block_offset(projection);
+ 
+@@ -100,13 +261,25 @@ void main() {
+     }
+ 
+     const uint col_stride = K_PER_ITER * BLOCK_SIZE;
+-    uint num_iters = p.ncols / col_stride;
+-    if (num_iters * col_stride + K_PER_ITER * tid < p.ncols) {
++#if !defined(NAVI22_STATIC_NCOLS)
++    uint num_iters = MMVQ_NCOLS / col_stride;
++    if (num_iters * col_stride + K_PER_ITER * tid < MMVQ_NCOLS) {
+         num_iters++;
+     }
++#endif
+ 
+     const uint b_qs_idx = tid % (32 / K_PER_ITER);
++#if defined(NAVI22_STATIC_NCOLS)
++    uint block_col = tid / (QUANT_K_Q8_1 / K_PER_ITER);
++#else
+     uint col = tid * K_PER_ITER;
++#endif
++#if defined(NAVI22_STATIC_NCOLS)
++    [[unroll]] for (uint k = 0; k < 8; ++k) {
++        iter(temp, a_block_offset, first_row, num_rows, block_col, b_qs_idx);
++        block_col += col_stride / QUANT_K_Q8_1;
++    }
++#else
+     while (num_iters >= 4) {
+         [[unroll]] for (uint k = 0; k < 4; ++k) {
+             iter(temp, a_block_offset, first_row, num_rows, col, b_qs_idx);
+@@ -124,6 +297,7 @@ void main() {
+     if (num_iters > 0) {
+         iter(temp, a_block_offset, first_row, num_rows, col, b_qs_idx);
+     }
++#endif
+ 
+     [[unroll]] for (uint row = 0; row < num_rows; ++row) {
+         temp[row] = subgroupAdd(temp[row]);
+@@ -134,3 +308,4 @@ void main() {
+         }
+     }
+ }
++#endif
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+index 18d441ead..befd82d22 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp
+@@ -28,7 +28,71 @@ vec2 cache_b_ds;
+ 
+ #include "mul_mat_vecq_funcs.glsl"
+ 
+-void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col, const uint b_qs_idx) {
++#if defined(NAVI22_Q4_0_PREFETCH_NEXT)
++#if !defined(DATA_A_Q4_0) || !defined(NAVI22_STATIC_NCOLS) || NAVI22_STATIC_NCOLS != 11008
++#error NAVI22_Q4_0_PREFETCH_NEXT requires the exact Q4_0 k11008 specialization
++#endif
++
++struct q4_0_prefetched_block {
++    i32vec2 qs;
++    FLOAT_TYPE d;
++};
++
++q4_0_prefetched_block prefetch_q4_0_block(const uint a_block_idx, const uint b_qs_idx) {
++    q4_0_prefetched_block block;
++    block.qs = repack(a_block_idx, b_qs_idx);
++    block.d = get_dm(a_block_idx);
++    return block;
++}
++
++FLOAT_TYPE dot_prefetched_q4_0(const q4_0_prefetched_block block) {
++    int32_t q_sum = 0;
++    q_sum += dotPacked4x8EXT(block.qs.x, cache_b_qs[0]);
++    q_sum += dotPacked4x8EXT(block.qs.y, cache_b_qs[1]);
++    return mul_q8_1(q_sum, block.d, cache_b_ds, 4);
++}
++
++void accumulate_prefetched_q4_0(
++        inout FLOAT_TYPE temp,
++        const q4_0_prefetched_block block,
++        const uint block_col,
++        const uint b_qs_idx) {
++    const uint b_block_idx = block_col + b_offset;
++    const uint b_block_idx_outer = b_block_idx / 4;
++    const uint b_block_idx_inner = b_block_idx % 4;
++    cache_b_ds = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
++    cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx];
++    cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx + 4];
++    temp += dot_prefetched_q4_0(block);
++}
++#endif
++
++#if defined(NAVI22_STATIC_NCOLS)
++#if !defined(DATA_A_Q4_0)
++#error NAVI22_STATIC_NCOLS requires DATA_A_Q4_0
++#endif
++#define MMVQ_NCOLS uint(NAVI22_STATIC_NCOLS)
++#else
++#define MMVQ_NCOLS p.ncols
++#endif
++
++void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const uint num_rows, const uint col_or_block, const uint b_qs_idx) {
++#if defined(NAVI22_STATIC_NCOLS)
++    const uint block_col = col_or_block;
++    const uint b_block_idx = block_col + b_offset;
++    const uint b_block_idx_outer = b_block_idx / 4;
++    const uint b_block_idx_inner = b_block_idx % 4;
++    cache_b_ds = vec2(data_b[b_block_idx_outer].ds[b_block_idx_inner]);
++    cache_b_qs[0] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx];
++    cache_b_qs[1] = data_b[b_block_idx_outer].qs[b_block_idx_inner * 8 + b_qs_idx + 4];
++
++    [[unroll]] for (uint n = 0; n < num_rows; ++n) {
++        const uint a_block_idx = (first_row + n) * (MMVQ_NCOLS / QUANT_K_Q8_1) +
++                                 block_col + a_offset;
++        temp[0][n] += mmvq_dot_product(a_block_idx, b_qs_idx);
++    }
++#else
++    const uint col = col_or_block;
+     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
+         // Preload data_b block
+         const uint b_block_idx = (j*p.batch_stride_b + col) / QUANT_K_Q8_1 + b_offset;
+@@ -63,14 +127,15 @@ void iter(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const uint first_row, const
+ #endif
+ #endif
+ 
+-        uint ibi = first_row*p.ncols;
++        uint ibi = first_row*MMVQ_NCOLS;
+         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
+             const uint a_block_idx = (ibi + col)/QUANT_K_Q8_1 + a_offset;
+-            ibi += p.ncols;
++            ibi += MMVQ_NCOLS;
+ 
+             temp[j][n] += mmvq_dot_product(a_block_idx, b_qs_idx);
+         }
+     }
++#endif
+ }
+ 
+ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+@@ -89,13 +154,37 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+     }
+ 
+     const uint col_stride = K_PER_ITER * BLOCK_SIZE;
+-    uint num_iters = p.ncols / col_stride;
+-    if (num_iters * col_stride + K_PER_ITER * tid < p.ncols) {
++#if !defined(NAVI22_STATIC_NCOLS)
++    uint num_iters = MMVQ_NCOLS / col_stride;
++    if (num_iters * col_stride + K_PER_ITER * tid < MMVQ_NCOLS) {
+         num_iters++;
+     }
++#endif
+ 
+     const uint b_qs_idx = tid % (32 / K_PER_ITER);
++#if defined(NAVI22_STATIC_NCOLS)
++    uint block_col = tid / (QUANT_K_Q8_1 / K_PER_ITER);
++#else
+     uint col = tid * K_PER_ITER;
++#endif
++#if defined(NAVI22_STATIC_NCOLS)
++#if NAVI22_STATIC_NCOLS == 4096
++    [[unroll]] for (uint k = 0; k < 8; ++k) {
++        iter(temp, first_row, num_rows, block_col, b_qs_idx);
++        block_col += col_stride / QUANT_K_Q8_1;
++    }
++#elif NAVI22_STATIC_NCOLS == 11008
++    [[unroll]] for (uint k = 0; k < 21; ++k) {
++        iter(temp, first_row, num_rows, block_col, b_qs_idx);
++        block_col += col_stride / QUANT_K_Q8_1;
++    }
++    if (tid < 32) {
++        iter(temp, first_row, num_rows, block_col, b_qs_idx);
++    }
++#else
++#error unsupported NAVI22_STATIC_NCOLS
++#endif
++#else
+     while (num_iters >= 4) {
+         // Manually partially unroll the loop
+         [[unroll]] for (uint k = 0; k < 4; ++k) {
+@@ -118,10 +207,53 @@ void compute_outputs(const uint32_t first_row, const uint32_t num_rows) {
+     if (num_iters > 0) {
+         iter(temp, first_row, num_rows, col, b_qs_idx);
+     }
++#endif
+ 
+     reduce_result(temp, d_offset, first_row, num_rows, tid);
+ }
+ 
++#if defined(NAVI22_Q4_0_PREFETCH_NEXT)
++void compute_outputs_prefetch_q4_0(const uint32_t first_row) {
++    const uint tid = gl_LocalInvocationID.x;
++
++    get_offsets(a_offset, b_offset, d_offset);
++    a_offset *= QUANT_K / QUANT_K_Q8_1;
++    b_offset /= QUANT_K_Q8_1;
++
++    FLOAT_TYPE temp[NUM_COLS][NUM_ROWS];
++    temp[0][0] = FLOAT_TYPE(0.0f);
++
++    const uint b_qs_idx = tid % (32 / K_PER_ITER);
++    const uint block_stride = (K_PER_ITER * BLOCK_SIZE) / QUANT_K_Q8_1;
++    uint block_col = tid / (QUANT_K_Q8_1 / K_PER_ITER);
++    uint a_block_idx = first_row * (uint(NAVI22_STATIC_NCOLS) / QUANT_K_Q8_1) +
++                       block_col + a_offset;
++    q4_0_prefetched_block current = prefetch_q4_0_block(a_block_idx, b_qs_idx);
++
++    [[unroll]] for (uint k = 0; k < 20; ++k) {
++        const uint next_block_col = block_col + block_stride;
++        const uint next_a_block_idx = a_block_idx + block_stride;
++        q4_0_prefetched_block next = prefetch_q4_0_block(next_a_block_idx, b_qs_idx);
++        accumulate_prefetched_q4_0(temp[0][0], current, block_col, b_qs_idx);
++        current = next;
++        block_col = next_block_col;
++        a_block_idx = next_a_block_idx;
++    }
++
++    if (tid < 32) {
++        const uint tail_block_col = block_col + block_stride;
++        const uint tail_a_block_idx = a_block_idx + block_stride;
++        q4_0_prefetched_block tail = prefetch_q4_0_block(tail_a_block_idx, b_qs_idx);
++        accumulate_prefetched_q4_0(temp[0][0], current, block_col, b_qs_idx);
++        accumulate_prefetched_q4_0(temp[0][0], tail, tail_block_col, b_qs_idx);
++    } else {
++        accumulate_prefetched_q4_0(temp[0][0], current, block_col, b_qs_idx);
++    }
++
++    reduce_result(temp, d_offset, first_row, 1, tid);
++}
++#endif
++
+ void main() {
+     const uint first_row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+ 
+@@ -129,6 +261,11 @@ void main() {
+     init_iq_shmem(gl_WorkGroupSize);
+ #endif
+ 
++#if defined(NAVI22_Q4_0_PREFETCH_NEXT)
++    compute_outputs_prefetch_q4_0(first_row);
++#elif defined(NAVI22_STATIC_FULL_ROWS)
++    compute_outputs(first_row, NUM_ROWS);
++#else
+     // do NUM_ROWS at a time, unless there aren't enough remaining rows
+     if (first_row + NUM_ROWS <= p.stride_d) {
+         compute_outputs(first_row, NUM_ROWS);
+@@ -138,4 +275,5 @@ void main() {
+         }
+         compute_outputs(first_row, p.stride_d - first_row);
+     }
++#endif
+ }
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/rope_qkv_set_rows_navi22.comp b/ggml/src/ggml-vulkan/vulkan-shaders/rope_qkv_set_rows_navi22.comp
+new file mode 100644
+index 000000000..27e7ca13e
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/rope_qkv_set_rows_navi22.comp
+@@ -0,0 +1,67 @@
++#version 450
++
++#include "types.glsl"
++
++#extension GL_EXT_shader_16bit_storage : require
++
++layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
++
++layout(binding = 0) readonly buffer QSrc { float q_src[]; };
++layout(binding = 1) readonly buffer KSrc { float k_src[]; };
++layout(binding = 2) readonly buffer VSrc { float v_src[]; };
++layout(binding = 3) readonly buffer Pos { int positions[]; };
++layout(binding = 4) writeonly buffer QDst { float q_dst[]; };
++layout(binding = 5) writeonly buffer KDst { float16_t k_dst[]; };
++layout(binding = 6) writeonly buffer VDst { float16_t v_dst[]; };
++layout(binding = 7) readonly buffer KIndices { uvec2 k_indices[]; };
++layout(binding = 8) readonly buffer VIndices { uvec2 v_indices[]; };
++
++layout(push_constant) uniform parameter {
++    float theta_scale;
++    uint k_row_stride;
++    uint v_row_stride;
++    uint q_src_offset;
++    uint k_src_offset;
++    uint v_src_offset;
++    uint pos_offset;
++    uint q_dst_offset;
++    uint k_dst_offset;
++    uint v_dst_offset;
++    uint k_index_offset;
++    uint v_index_offset;
++    uint v_scalar_rows;
++} p;
++
++void main() {
++    const uint lane = gl_LocalInvocationID.x;
++    const uint head = gl_WorkGroupID.y;
++    const uint pair = head * 128 + 2 * lane;
++
++    const float theta_base = float(positions[p.pos_offset]) * pow(p.theta_scale, float(lane));
++    const float cos_theta = cos(theta_base);
++    const float sin_theta = sin(theta_base);
++
++    const float q0 = q_src[p.q_src_offset + pair + 0];
++    const float q1 = q_src[p.q_src_offset + pair + 1];
++    q_dst[p.q_dst_offset + pair + 0] = q0 * cos_theta - q1 * sin_theta;
++    q_dst[p.q_dst_offset + pair + 1] = q0 * sin_theta + q1 * cos_theta;
++
++    const uint k_row = k_indices[p.k_index_offset].x * p.k_row_stride;
++    const float k0 = k_src[p.k_src_offset + pair + 0];
++    const float k1 = k_src[p.k_src_offset + pair + 1];
++    k_dst[p.k_dst_offset + k_row + pair + 0] = float16_t(k0 * cos_theta - k1 * sin_theta);
++    k_dst[p.k_dst_offset + k_row + pair + 1] = float16_t(k0 * sin_theta + k1 * cos_theta);
++
++    if (p.v_scalar_rows == 0) {
++        const uint v_row = v_indices[p.v_index_offset].x * p.v_row_stride;
++        v_dst[p.v_dst_offset + v_row + pair + 0] = float16_t(v_src[p.v_src_offset + pair + 0]);
++        v_dst[p.v_dst_offset + v_row + pair + 1] = float16_t(v_src[p.v_src_offset + pair + 1]);
++    } else {
++        const uint v_idx0 = pair + 0;
++        const uint v_idx1 = pair + 1;
++        v_dst[p.v_dst_offset + v_indices[p.v_index_offset + v_idx0].x] =
++            float16_t(v_src[p.v_src_offset + v_idx0]);
++        v_dst[p.v_dst_offset + v_indices[p.v_index_offset + v_idx1].x] =
++            float16_t(v_src[p.v_src_offset + v_idx1]);
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index e505bdc2a..ae593a517 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -704,6 +704,10 @@ void process_shaders() {
+         }
+     }
+ 
++    string_to_spv("fa_masked_split_q8_1_x4_navi22", "flash_attn_decode_f16_navi22.comp",
++        {{"ACC_TYPE", "float"}, {"FLOAT_TYPE", "float16_t"}, {"FLOAT_TYPEV2", "f16vec2"}, {"FLOAT_TYPEV4", "f16vec4"}},
++        true, false, false, false);
++
+     const std::map<std::string, std::string> fa_bf16_dict = {
+         {"FLOAT_TYPE",   "bfloat16_t"},
+         {"FLOAT_TYPEV2", "bf16vec2"},
+@@ -732,7 +736,47 @@ void process_shaders() {
+     string_to_spv(
+         "mul_mat_vec_q4_0_q8_1_f32_multiproj_navi22",
+         "mul_mat_vec_q4_0_multiproj_navi22.comp",
+-        merge_maps(base_dict, {{"DATA_A_Q4_0", "1"}}));
++        merge_maps(base_dict, {{"DATA_A_Q4_0", "1"}, {"NAVI22_STATIC_NCOLS", "4096"},
++                               {"NAVI22_STATIC_NROWS", "11008"},
++                               {"NAVI22_STATIC_FULL_ROWS", "1"}}));
++    string_to_spv(
++        "mul_mat_vec_q4_0_q8_1_f32_multiproj_qkv_rows1_navi22",
++        "mul_mat_vec_q4_0_multiproj_navi22.comp",
++        merge_maps(base_dict, {{"DATA_A_Q4_0", "1"}, {"NUM_ROWS", "1"},
++                               {"NAVI22_QKV_SHARED_ACTIVATION", "1"},
++                               {"NAVI22_STATIC_NCOLS", "4096"},
++                               {"NAVI22_STATIC_NROWS", "4096"},
++                               {"NAVI22_STATIC_FULL_ROWS", "1"}}));
++    string_to_spv(
++        "mul_mat_vec_q4_0_q8_1_f32_multiproj_ffn_swiglu_navi22",
++        "mul_mat_vec_q4_0_multiproj_navi22.comp",
++        merge_maps(base_dict, {{"DATA_A_Q4_0", "1"}, {"NUM_ROWS", "1"},
++                               {"NAVI22_FFN_SWIGLU_FUSED", "1"},
++                               {"NAVI22_STATIC_NCOLS", "4096"},
++                               {"NAVI22_STATIC_NROWS", "11008"},
++                               {"NAVI22_STATIC_FULL_ROWS", "1"}}));
++    string_to_spv(
++        "mul_mat_vec_q4_0_q8_1_f32_navi22_k4096",
++        "mul_mat_vecq.comp",
++        merge_maps(base_dict, {{"DATA_A_Q4_0", "1"}, {"D_TYPE", "float"},
++                               {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"},
++                               {"NAVI22_STATIC_NCOLS", "4096"},
++                               {"NAVI22_STATIC_FULL_ROWS", "1"}}));
++    string_to_spv(
++        "mul_mat_vec_q4_0_q8_1_f32_navi22_k11008",
++        "mul_mat_vecq.comp",
++        merge_maps(base_dict, {{"DATA_A_Q4_0", "1"}, {"D_TYPE", "float"},
++                               {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"},
++                               {"NAVI22_STATIC_NCOLS", "11008"},
++                               {"NAVI22_STATIC_FULL_ROWS", "1"}}));
++    string_to_spv(
++        "mul_mat_vec_q4_0_q8_1_f32_navi22_k11008_prefetch",
++        "mul_mat_vecq.comp",
++        merge_maps(base_dict, {{"DATA_A_Q4_0", "1"}, {"D_TYPE", "float"},
++                               {"ACC_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"},
++                               {"NAVI22_STATIC_NCOLS", "11008"},
++                               {"NAVI22_STATIC_FULL_ROWS", "1"},
++                               {"NAVI22_Q4_0_PREFETCH_NEXT", "1"}}));
+ #endif
+ 
+     for (const auto& tname : type_names) {
+@@ -799,7 +843,12 @@ void process_shaders() {
+ 
+     string_to_spv("mul_mat_vec_p021_f16_f32_subgroup_add", "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
+     string_to_spv("mul_mat_vec_p021_f16_f32",              "mul_mat_vec_p021.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
++    string_to_spv("mul_mat_vec_f16_attn_qk_rows16_dualwave_navi22", "mul_mat_vec_f16_attn_qk_rows16_dualwave_navi22.comp", {});
++    string_to_spv("mul_mat_vec_f16_attn_av_rows8_navi22", "mul_mat_vec_f16_attn_av_rows8_navi22.comp", {});
++    string_to_spv("mul_mat_vec_f16_attn_av_rows16_navi22", "mul_mat_vec_f16_attn_av_rows16_navi22.comp", {});
++    string_to_spv("mul_mat_vec_f16_attn_av_rows32_dualwave_navi22", "mul_mat_vec_f16_attn_av_rows32_dualwave_navi22.comp", {});
+     string_to_spv("mul_mat_vec_nc_f16_f32", "mul_mat_vec_nc.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}});
++    string_to_spv("mul_mat_vec_nc_f16_f32_subgroup_add_navi22", "mul_mat_vec_nc.comp", {{"A_TYPE", "float16_t"}, {"A_TYPEV4", "f16vec4"}, {"B_TYPE", "float"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}});
+ 
+     // Norms
+     string_to_spv("norm_f32", "norm.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+@@ -1009,6 +1058,7 @@ void process_shaders() {
+     string_to_spv("rope_norm_f32", "rope_norm.comp", {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float"}});
+     string_to_spv("rope_norm_f16", "rope_norm.comp", {{"A_TYPE", "float16_t"}, {"ROPE_D_TYPE", "float16_t"}});
+     string_to_spv("rope_norm_f32_f16", "rope_norm.comp", {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float16_t"}});
++    string_to_spv("rope_qkv_set_rows_navi22", "rope_qkv_set_rows_navi22.comp", {});
+ 
+     string_to_spv("rope_neox_f32", "rope_neox.comp", {{"A_TYPE", "float"}, {"ROPE_D_TYPE", "float"}});
+     string_to_spv("rope_neox_f16", "rope_neox.comp", {{"A_TYPE", "float16_t"}, {"ROPE_D_TYPE", "float16_t"}});
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 6a0efadb5..fa2668622 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9121,6 +9121,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+ #endif
+ 
++    // Llama 2 7B non-flash decode QK matvec (32 heads, one query token).
++    test_cases.emplace_back(new test_mul_mat(
++        GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 256, {32, 1}, {1, 1}));
++    // Llama 2 7B non-flash decode AV matvec (p021 V cache, 32 heads).
++    test_cases.emplace_back(new test_mul_mat(
++        GGML_TYPE_F16, GGML_TYPE_F32, 256, 1, 128, {32, 1}, {1, 1}, {0, 2, 1, 3}));
++
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  64, 2,  128, { 8,  1}, {1, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  83, 2,  128, { 8,  1}, {4, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  64, 2,   64, { 8,  1}, {4, 1}));

@@ -1,0 +1,266 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: austxu <austxu@users.noreply.github.com>
+Date: Thu, 16 Jul 2026 17:42:54 -0700
+Subject: [PATCH 4/9] vulkan: fuse Q4_0 RMSNorm activation on Navi22
+
+Extend the opt-in direct RMSNorm+MUL Q8_1 sidecar to the stock Q4_0 MMVQ consumer, keep conflicting routing overrides fail-closed, and expose per-format coverage counters. Add whole-graph CPU-reference coverage for Llama 2 shapes, boundaries, residual partials, cache reuse, and fallbacks.
+
+Assisted-by: Codex <noreply@openai.com>
+---
+ ggml/src/ggml-vulkan/ggml-vulkan.cpp | 60 +++++++++++++++++++---
+ tests/test-backend-ops.cpp           | 77 ++++++++++++++++++++++++++++
+ 2 files changed, 130 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 3e6be2a96be572577bb6fbd2eee69800612d9004..4c3715327a8d5e588454d4aed39422597e59cdef 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -2197,8 +2197,14 @@ struct ggml_backend_vk_context {
+     uint32_t rms_norm_mul_q8_1_next_matmul {};
+     uint32_t rms_norm_mul_q8_1_activation_match {};
+     uint32_t rms_norm_mul_q8_1_q4_shape {};
++    uint32_t rms_norm_mul_q8_1_q4_0_shape {};
++    uint32_t rms_norm_mul_q8_1_q4_k_shape {};
+     uint32_t rms_norm_mul_q8_1_route {};
++    uint32_t rms_norm_mul_q8_1_q4_0_route {};
++    uint32_t rms_norm_mul_q8_1_q4_k_route {};
+     uint32_t rms_norm_mul_q8_1_dispatches {};
++    uint32_t rms_norm_mul_q8_1_q4_0_dispatches {};
++    uint32_t rms_norm_mul_q8_1_q4_k_dispatches {};
+     uint32_t rms_norm_mul_q8_1_partial_dispatches {};
+     uint32_t rms_norm_mul_q8_1_direct_dispatches {};
+     topk_moe_mode fused_topk_moe_mode {};
+@@ -6694,10 +6700,11 @@ static vk_device ggml_vk_get_device(size_t idx) {
+             } else if (rms_norm_mul_q8_1_navi22_mode_env == nullptr ||
+                        strcmp(rms_norm_mul_q8_1_navi22_mode_env, "direct") != 0) {
+                 rejection_reason = "GGML_VK_RMS_NORM_MUL_Q8_1_NAVI22_MODE must be exactly direct";
+-            } else if (!device->q4_k_mmvq_navi22) {
+-                rejection_reason = "the GGML_VK_Q4_K_MMVQ_NAVI22 route must be enabled";
+             } else if (getenv("GGML_VK_DISABLE_FUSION") != nullptr) {
+                 rejection_reason = "GGML_VK_DISABLE_FUSION must be unset";
++            } else if (getenv("GGML_VK_FORCE_MMVQ") != nullptr ||
++                       getenv("GGML_VK_DISABLE_MMVQ") != nullptr) {
++                rejection_reason = "GGML_VK_FORCE_MMVQ and GGML_VK_DISABLE_MMVQ must be unset";
+             } else if (device->vendor_id != VK_VENDOR_ID_AMD ||
+                        device->properties.deviceID != navi22_rx_6700_xt_device_id) {
+                 rejection_reason = "the selected device is not an AMD Radeon RX 6700 XT (device ID 0x73df)";
+@@ -12887,7 +12894,10 @@ static bool ggml_vk_rms_norm_mul_q8_1_navi22_eligible(
+         ggml_backend_vk_context * ctx,
+         const ggml_cgraph * cgraph,
+         int node_idx,
+-        const ggml_tensor * activation) {
++        const ggml_tensor * activation,
++        enum ggml_type * q4_type) {
++    GGML_ASSERT(q4_type != nullptr);
++    *q4_type = GGML_TYPE_COUNT;
+     if (!ctx->device->rms_norm_mul_q8_1_navi22 ||
+         ctx->num_additional_fused_ops != 1) {
+         return false;
+@@ -12917,7 +12927,7 @@ static bool ggml_vk_rms_norm_mul_q8_1_navi22_eligible(
+     ++ctx->rms_norm_mul_q8_1_activation_match;
+     if (
+         weight == nullptr ||
+-        weight->type != GGML_TYPE_Q4_K ||
++        (weight->type != GGML_TYPE_Q4_0 && weight->type != GGML_TYPE_Q4_K) ||
+         activation->type != GGML_TYPE_F32 ||
+         consumer->type != GGML_TYPE_F32 ||
+         consumer->ne[1] != 1 ||
+@@ -12929,6 +12939,11 @@ static bool ggml_vk_rms_norm_mul_q8_1_navi22_eligible(
+         return false;
+     }
+     ++ctx->rms_norm_mul_q8_1_q4_shape;
++    if (weight->type == GGML_TYPE_Q4_0) {
++        ++ctx->rms_norm_mul_q8_1_q4_0_shape;
++    } else {
++        ++ctx->rms_norm_mul_q8_1_q4_k_shape;
++    }
+ 
+     const int64_t k64 = activation->ne[0];
+     if ((k64 != 4096 && k64 != 14336) || (k64 % 128) != 0) {
+@@ -12947,6 +12962,12 @@ static bool ggml_vk_rms_norm_mul_q8_1_navi22_eligible(
+             (uint32_t) consumer->ne[0], k) != nullptr;
+     if (route) {
+         ++ctx->rms_norm_mul_q8_1_route;
++        if (weight->type == GGML_TYPE_Q4_0) {
++            ++ctx->rms_norm_mul_q8_1_q4_0_route;
++        } else {
++            ++ctx->rms_norm_mul_q8_1_q4_k_route;
++        }
++        *q4_type = weight->type;
+     }
+     return route;
+ }
+@@ -12957,7 +12978,8 @@ static void ggml_vk_rms_norm_mul_q8_1_navi22(
+         const ggml_tensor * src0,
+         const ggml_tensor * src1,
+         ggml_tensor * dst,
+-        vk_op_binary_push_constants & pc) {
++        vk_op_binary_push_constants & pc,
++        enum ggml_type q4_type) {
+     const size_t ne = ggml_nelements(dst);
+     const size_t q8_size = ggml_vk_align_size(ne, 128) *
+                            ggml_type_size(GGML_TYPE_Q8_1) /
+@@ -13019,6 +13041,12 @@ static void ggml_vk_rms_norm_mul_q8_1_navi22(
+     ctx->prealloc_y_fused_q8_write_pending = true;
+     ctx->prealloc_y_need_sync = true;
+     ++ctx->rms_norm_mul_q8_1_dispatches;
++    if (q4_type == GGML_TYPE_Q4_0) {
++        ++ctx->rms_norm_mul_q8_1_q4_0_dispatches;
++    } else {
++        GGML_ASSERT(q4_type == GGML_TYPE_Q4_K);
++        ++ctx->rms_norm_mul_q8_1_q4_k_dispatches;
++    }
+ }
+ 
+ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx, float * op_params) {
+@@ -13052,6 +13080,7 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx,
+         0,
+         op_params[0], 0.0f, (int32_t)param3,
+     };
++    enum ggml_type q4_type = GGML_TYPE_COUNT;
+ 
+     // more than one fused op means rms_norm+mul+rope
+     if (ctx->num_additional_fused_ops > 1) {
+@@ -13130,12 +13159,12 @@ static void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx,
+                 ggml_vk_subbuffer(ctx, buf[5], offset[5]),
+                 ggml_vk_subbuffer(ctx, buf[6], offset[6]),
+             }, pc, elements);
+-    } else if (ggml_vk_rms_norm_mul_q8_1_navi22_eligible(ctx, cgraph, node_idx, dst) &&
++    } else if (ggml_vk_rms_norm_mul_q8_1_navi22_eligible(ctx, cgraph, node_idx, dst, &q4_type) &&
+                src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+                ggml_nrows(src0) == 1 && ggml_nrows(src1) == 1 && ggml_nrows(dst) == 1 &&
+                src0->ne[0] == dst->ne[0] && src1->ne[0] == dst->ne[0] &&
+                ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+-        ggml_vk_rms_norm_mul_q8_1_navi22(ctx, subctx, src0, src1, dst, bin);
++        ggml_vk_rms_norm_mul_q8_1_navi22(ctx, subctx, src0, src1, dst, bin, q4_type);
+     } else {
+         ggml_vk_op_f32<vk_op_binary_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_RMS_NORM, std::move(bin));
+     }
+@@ -16828,8 +16857,14 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+     ctx->rms_norm_mul_q8_1_next_matmul = 0;
+     ctx->rms_norm_mul_q8_1_activation_match = 0;
+     ctx->rms_norm_mul_q8_1_q4_shape = 0;
++    ctx->rms_norm_mul_q8_1_q4_0_shape = 0;
++    ctx->rms_norm_mul_q8_1_q4_k_shape = 0;
+     ctx->rms_norm_mul_q8_1_route = 0;
++    ctx->rms_norm_mul_q8_1_q4_0_route = 0;
++    ctx->rms_norm_mul_q8_1_q4_k_route = 0;
+     ctx->rms_norm_mul_q8_1_dispatches = 0;
++    ctx->rms_norm_mul_q8_1_q4_0_dispatches = 0;
++    ctx->rms_norm_mul_q8_1_q4_k_dispatches = 0;
+     ctx->rms_norm_mul_q8_1_partial_dispatches = 0;
+     ctx->rms_norm_mul_q8_1_direct_dispatches = 0;
+ 
+@@ -17130,6 +17165,17 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
+             ctx->rms_norm_mul_q8_1_dispatches,
+             ctx->rms_norm_mul_q8_1_partial_dispatches,
+             ctx->rms_norm_mul_q8_1_direct_dispatches);
++        fprintf(
++            stderr,
++            "ggml_vulkan: Navi22 RMSNorm+MUL -> Q8_1_x4 format coverage "
++            "(q4_0_shape=%u q4_k_shape=%u q4_0_route=%u q4_k_route=%u "
++            "q4_0_dispatched=%u q4_k_dispatched=%u)\n",
++            ctx->rms_norm_mul_q8_1_q4_0_shape,
++            ctx->rms_norm_mul_q8_1_q4_k_shape,
++            ctx->rms_norm_mul_q8_1_q4_0_route,
++            ctx->rms_norm_mul_q8_1_q4_k_route,
++            ctx->rms_norm_mul_q8_1_q4_0_dispatches,
++            ctx->rms_norm_mul_q8_1_q4_k_dispatches);
+     }
+ 
+     if (vk_perf_logger_enabled) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index e3553c5e9ca19bb23255f44af879ef547455dc57..da93719eb476f01a5346bff32a4cf839c75449a9 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3595,6 +3595,73 @@ struct test_rms_norm_mul_add : public test_case {
+     }
+ };
+ 
++// GGML_OP_RMS_NORM + GGML_OP_MUL + GGML_OP_MUL_MAT
++struct test_rms_norm_mul_q4_0_mul_mat : public test_case {
++    const int64_t k;
++    const int64_t output_rows;
++    const int64_t n;
++    const bool add_input;
++    const uint32_t consumers;
++    const float eps;
++
++    test_rms_norm_mul_q4_0_mul_mat(
++            int64_t k,
++            int64_t output_rows,
++            int64_t n = 1,
++            bool add_input = false,
++            uint32_t consumers = 1,
++            float eps = 1e-6f)
++        : k(k), output_rows(output_rows), n(n), add_input(add_input), consumers(consumers),
++          eps(eps) {
++        GGML_ASSERT(k > 0 && k % ggml_blck_size(GGML_TYPE_Q4_0) == 0);
++        GGML_ASSERT(output_rows > 0 && n > 0);
++        GGML_ASSERT(consumers == 1 || consumers == 2);
++    }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "RMS_NORM_MUL_Q4_0_MUL_MAT";
++    }
++
++    std::string vars() override {
++        return VARS_TO_STR6(k, output_rows, n, add_input, consumers, eps);
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
++        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k);
++        ggml_set_name(input, "input");
++        ggml_set_name(scale, "scale");
++
++        if (add_input) {
++            ggml_tensor * residual = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
++            ggml_set_name(residual, "residual");
++            input = ggml_add(ctx, input, residual);
++            ggml_set_name(input, "input_add");
++        }
++
++        ggml_tensor * activation = ggml_mul(ctx, ggml_rms_norm(ctx, input, eps), scale);
++        ggml_set_name(activation, "activation");
++
++        ggml_tensor * out = nullptr;
++        for (uint32_t i = 0; i < consumers; ++i) {
++            ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, k, output_rows);
++            ggml_format_name(weight, "weight_%u", i);
++            ggml_tensor * consumer = ggml_mul_mat(ctx, weight, activation);
++            ggml_format_name(consumer, "consumer_%u", i);
++            out = out == nullptr ? consumer : ggml_add(ctx, out, consumer);
++        }
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    double max_nmse_err() override {
++        return 5e-4;
++    }
++};
++
+ // GGML_OP_ADD + GGML_OP_RMS_NORM (fused operation)
+ struct test_add_rms_norm : public test_case {
+     const ggml_type type;
+@@ -8717,6 +8784,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
+     }
+ 
++    for (int64_t output_rows : {1, 2, 3, 31, 32, 33, 4095, 4096, 4097}) {
++        test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, output_rows));
++    }
++    test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 11008));
++    test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(14336, 33));
++    test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 4096, 1, true));
++    test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 33, 1, false, 2));
++    test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4096, 33, 2));
++    test_cases.emplace_back(new test_rms_norm_mul_q4_0_mul_mat(4160, 33));
++
+     for (auto multi_add : {false, true}) {
+         for (auto set_rows : {false, true}) {
+             for (auto rope : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX}) {

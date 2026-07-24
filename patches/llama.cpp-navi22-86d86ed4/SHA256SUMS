@@ -1,0 +1,9 @@
+d52733cf1e61186ab990666bfebf4a8c050b70d632968108887fc65dcb1b047a  0001-vulkan-add-Navi22-Q4_K-rows2-decode-route.patch
+9ac259815db5f83ecaa2ef855e2428354c54a98687d71087b0d565d87da882f7  0002-vulkan-fuse-Navi22-RMSNorm-multiply-into-Q8_1.patch
+0bf0b4c66c2015d0d99a424c2c4e592ec69e6b16ebbfd215181547b95abbc5ef  0003-llama-bench-add-guarded-depth-prefill-pacing.patch
+83f8971068193241271415efe65926c39ee391ca24bf2587b22cc317b107d155  0004-vulkan-fuse-Q4_0-RMSNorm-activation-on-Navi22.patch
+b33503b291978e3c93d402003ac8acf85e1db4b97fa0c8170d0be44db3986cba  0005-vulkan-add-Navi22-Q4_0-wave64-rows2-route.patch
+0c90c2155b891fdedd0ebac8b5e24ce5062145989cb37d154d5512b9a7ce621e  0006-vulkan-co-dispatch-Llama-2-Q4_0-projections.patch
+64866bdd9728aa47eebfba3ef913157de5d88219fec3b917255bfb0599baab77  0007-vulkan-defer-Navi22-diagnostics-to-decode.patch
+6d6bc0d142354720dd28b837a7a3200da923c1bd62540cfbade3d4aca31e890d  0008-vulkan-fuse-Llama-2-attention-output-on-Navi22.patch
+3b5d64b8224146b3d3cf9fc1b01d0c87810e209c46bfac3b26a718d9f0a5ea1e  0009-vulkan-fix-attention-reducer-dispatch-geometry.patch

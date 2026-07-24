@@ -1,0 +1,17 @@
+{
+  "outcomes": {
+    "llama2": {
+      "artifact_root": "artifacts/public-release/current-master/correctness/llama2-20260724T065633Z",
+      "decision": "fail",
+      "evidence_status": "sealed",
+      "failure_class": "numerical-correctness",
+      "failure_count": 12,
+      "performance_timing_authorized": false,
+      "profile": "llama2",
+      "source_root_manifest_sha256": "78dac576e71305ee1810772cd0e9c499769a24178d23df545121d055157d24c2",
+      "source_root_sealed": true,
+      "source_summary_sha256": "13543e2e55c4bf4fb53f82b71ba524814c98cc7eb0939578e56e38ca6e723a9f"
+    }
+  },
+  "schema": "current-master-correctness-outcomes-v1"
+}
