@@ -1,168 +1,142 @@
-# RX 6700 XT Llama 2 Vulkan optimizations
+# 13.93% faster Llama 2 decode on an AMD RX 6700 XT
 
-On an AMD Radeon RX 6700 XT, the retained opt-in `llama.cpp` Vulkan profile
-improved Llama 2 7B `Q4_0` generation (`tg128`) by **13.928% with flash
-attention off** and **11.290% with flash attention on** versus its matched
-paced control. Prompt processing (`pp512`) was statistically neutral:
-`+0.004%` and `+0.015%`, with both 95% intervals crossing zero.
+Vulkan kernel and graph changes to `llama.cpp` that speed up Llama 2 7B `Q4_0`
+token generation on an RX 6700 XT (Navi22), measured against a matched control
+with checksummed raw evidence.
 
-These are author-operated, matched measurements from a dated custom source
-profile. They are not current-master results, an accepted scoreboard entry,
-an independent reproduction, an MLPerf result, or a general AMD performance
-claim.
+**Write-up → [austxu.dev/blog/rx-6700xt-llama2-decode](https://austxu.dev/blog/rx-6700xt-llama2-decode)**
+· [Project page](https://austxu.dev/work/amd-inference)
 
-This reader-facing release contains the checksummed source patches, compact raw
-evidence, deterministic analysis, source/build instructions, and the sealed
-negative result from a later current-master correctness cutline. Model weights
-are not included.
+[![Project page: 13.93% faster decode, 75.23 to 85.71 tokens/s](docs/images/project-page.webp)](https://austxu.dev/work/amd-inference)
 
 ## Results
 
-Each row contains 84 raw samples: three independent `A1 B1 B2 A2` cycles with
-seven samples per invocation. Intervals are deterministic paired 95%
-hierarchical-bootstrap intervals with 100,000 replicates.
-
-| Source profile and cell | Control t/s | Candidate t/s | Paired gain | 95% CI |
+| Llama 2 7B `Q4_0`, decode (`tg128`) | Control | Optimized | Paired gain | 95% CI |
 | --- | ---: | ---: | ---: | ---: |
-| Nine-patch, FA-off pp512 | 1236.773 | 1237.596 | +0.067% | [+0.018%, +0.114%] |
-| Nine-patch, FA-off tg128 | 75.837 | 78.017 | +2.878% | [+1.944%, +3.493%] |
-| Nine-patch, FA-on pp512 | 1271.995 | 1271.524 | -0.037% | [-0.082%, +0.019%] |
-| Nine-patch, FA-on tg128 | 80.888 | 84.097 | +3.969% | [+3.314%, +4.644%] |
-| Retained-a551, FA-off pp512 | 1237.031 | 1237.083 | +0.004% | [-0.040%, +0.054%] |
-| Retained-a551, FA-off tg128 | 75.231 | 85.710 | +13.928% | [+13.656%, +14.193%] |
-| Retained-a551, FA-on pp512 | 1272.243 | 1272.429 | +0.015% | [-0.090%, +0.093%] |
-| Retained-a551, FA-on tg128 | 80.569 | 89.665 | +11.290% | [+10.908%, +11.716%] |
+| Flash attention off | 75.23 t/s | **85.71 t/s** | **+13.93%** | [+13.66%, +14.19%] |
+| Flash attention on | 80.57 t/s | **89.67 t/s** | **+11.29%** | [+10.91%, +11.72%] |
 
-The strongest retained absolute means were `85.709606` t/s FA-off and
-`89.665432` t/s FA-on. Its 12/12 guarded invocations produced 336 raw samples,
-peaked at 94 C below the 95 C abort threshold, and restored the 186 W stock
-cap and automatic fan after every invocation. The compact release evidence
-contains both accepted campaigns: 24 raw result records, 672 raw samples, and
-eight regenerated rows.
+Prompt processing (`pp512`) is unchanged: +0.004% and +0.015%, with both
+intervals crossing zero. The gain is in decode, where the model runs the same
+small graph once per generated token.
 
-See [Results](docs/RESULTS.md) for the complete interpretation and
-[Methodology](docs/METHODOLOGY.md) for the correctness, thermal, and
-statistical gates.
+![Every decode sample: optimized runs separate cleanly from control](docs/images/decode-samples.svg)
 
-## Scoreboard boundary
+At 85.71 t/s, a 256-token reply finishes in 2.99 s instead of 3.40 s:
 
-The historical comparison is the RX 6700 XT row in the
-[`llama.cpp` Vulkan discussion](https://github.com/ggml-org/llama.cpp/discussions/10879):
-Llama 2 7B `Q4_0`, FA-off, `tg128`, `83.88 ± 0.08` t/s at llama.cpp
-`6d758839ff741d4966ca92b7f801b7a8b5b96364`. A guarded local recreation of
-that source and workload measured `81.559936 ± 0.328402` t/s; it does not
-revise or independently reproduce the posted row.
+[![Real-time token race, control vs optimized](docs/images/token-race.webp)](https://austxu.dev/work/amd-inference)
 
-The discussion's main post asks contributors to clone and build `llama.cpp`
-and report the Git hash and Vulkan information, but it does not explicitly say
-“master only.” In a later comment, `llama.cpp` collaborator `0cc4m`
-[said](https://github.com/ggml-org/llama.cpp/discussions/10879#discussioncomment-17557303)
-that the thread is for master-branch performance. The retained custom-source
-result is therefore outside the scoreboard's stated scope unless a curator
-explicitly grants an exception.
+## What changed
 
-Some checksum-bound historical `analysis.json` files retain the categorical
-“master-only” wording used when those campaigns were sealed. They remain
-byte-for-byte unchanged as historical evidence; the interpretation above and
-the current evidence index are the corrected policy statement.
+Decode on a 7B model is dominated by matrix-vector products against quantized
+weights, plus many small dispatches around them. The patches attack both.
 
-Accordingly, the retained FA-off mean is only a local matched result that is
-numerically above the historical row. This repository does not describe it as
-an official result or record.
+```mermaid
+flowchart LR
+    h[hidden state] --> n1["RMSNorm × weight<br/>+ Q8_1 quantize<br/><b>one dispatch</b>"]
+    n1 --> qkv["Q, K, V projections<br/><b>one grouped launch</b>"]
+    qkv --> rope["RoPE + K/V cache write<br/><b>one dispatch</b>"]
+    rope --> att["attention + output<br/>Navi22 kernels"]
+    att --> n2["RMSNorm + Q8_1<br/><b>one dispatch</b>"]
+    n2 --> ffn["gate + up + SwiGLU<br/><b>one grouped launch</b>"]
+    ffn --> down["down projection<br/>prefetching kernel"]
+```
 
-## Three reader paths
+- **Shape-specific `Q4_0 × Q8_1` kernels.** Wave64 integer-dot matrix-vector
+  kernels with two output rows per workgroup, plus one-row variants for the
+  shared QKV group and the 4,096 × 11,008 down projection. The down projection
+  preloads the next weight block while it accumulates the current one.
+- **Fused activation prep.** RMSNorm and its scale also write the `Q8_1`
+  activation the next matrix-vector product reads, removing a standalone
+  quantization dispatch.
+- **Grouped projections.** Q, K and V share one launch, and so do the
+  feed-forward gate and up projections, which write SwiGLU directly. Every
+  candidate process logged 62 grouped launches covering 156 projections.
+- **Fused post-QKV work.** Rotary encoding and the K/V cache writes run in one
+  dispatch per layer.
 
-### 1. Verify the published numbers
+Every route is opt-in by environment variable and off when unset. The
+retained profile is ten patches on official `llama.cpp`
+[`86d86ed4`](https://github.com/ggml-org/llama.cpp/commit/86d86ed4396b4130922f7b9af26e3d9fc11a591b);
+see [`patches/`](patches).
 
-No model or GPU is required:
+## How it was measured
+
+- **Matched control.** The control is the same source with identical
+  benchmark pacing, so the only difference is the optimized routes.
+- **ABBA design.** Three independent `A1 B1 B2 A2` cycles with seven samples
+  per invocation, 84 raw samples per result row, to cancel drift and
+  ordering effects.
+- **Statistics.** Paired 95% hierarchical-bootstrap intervals with 100,000
+  deterministic replicates.
+- **Correctness gates** before any timing, comparing tokens and logits.
+- **Hardware guard.** A 174 W run cap, forced fans, and a 95 °C abort. The
+  peak was 94 °C, and the stock 186 W cap and automatic fan were restored
+  after every invocation.
+
+Full detail is in [Methodology](docs/METHODOLOGY.md) and
+[Results](docs/RESULTS.md).
+
+## Scope
+
+- These are author-operated measurements on one card, from a dated
+  custom-source profile. They are not an independent reproduction or a general
+  AMD claim.
+- The FA-off mean of 85.71 t/s is numerically above the RX 6700 XT row in the
+  [`llama.cpp` Vulkan scoreboard](https://github.com/ggml-org/llama.cpp/discussions/10879)
+  (83.88 t/s). That thread is for master-branch builds, so this is not a
+  scoreboard entry or a record.
+- A later port to current master
+  ([`0cea3622`](https://github.com/ggml-org/llama.cpp/commit/0cea36222fe9bac5ebfc45716c9eef11f37046c4))
+  produced byte-identical Vulkan output for control and candidate, but failed
+  the predeclared CPU-versus-Vulkan accuracy gates for both. So no
+  current-master timing was run, and the results above are not current-master
+  numbers. See the [negative result](release/evidence/negative-results/current-master/llama2/summary.json).
+
+More in [Limitations](docs/LIMITATIONS.md).
+
+## Reproduce
+
+**Verify the published numbers.** No GPU or model needed. This checks every
+evidence checksum, recomputes all eight result rows and their intervals, and
+byte-compares them with the tracked outputs:
 
 ```bash
 scripts/linux/reproduce_public_release.sh analysis
 ```
 
-This verifies every compact-evidence checksum, recomputes all eight rows and
-their confidence intervals, byte-compares the regenerated outputs, and
-verifies the checksums again without changing the evidence tree.
-
-### 2. Reconstruct and build the exact source
-
-The nine-patch campaign has a one-command source/build verifier:
+**Rebuild the exact benchmarked source.** Start from the pinned official base
+and apply the retained patches. The script verifies the final Git tree
+`2d3add3e`, which is byte-identical to the benchmarked tree:
 
 ```bash
-scripts/linux/build_public_llamacpp.sh
-```
-
-For the strongest retained profile, start from a clean checkout at the pinned
-official base and apply the retained package:
-
-```bash
-git clone https://github.com/ggml-org/llama.cpp.git \
-  external/llama.cpp-retained-a551
-git -C external/llama.cpp-retained-a551 checkout \
-  86d86ed4396b4130922f7b9af26e3d9fc11a591b
+git clone https://github.com/ggml-org/llama.cpp.git external/llama.cpp-retained-a551
+git -C external/llama.cpp-retained-a551 checkout 86d86ed4396b4130922f7b9af26e3d9fc11a591b
 git -C external/llama.cpp-retained-a551 switch -c retained-a551-reproduction
-scripts/apply_llamacpp_navi22_retained_a551.sh \
-  external/llama.cpp-retained-a551
+scripts/apply_llamacpp_navi22_retained_a551.sh external/llama.cpp-retained-a551
 ```
 
-The apply script verifies both patch manifests and the exact final Git tree
-`2d3add3e01638795ff1cdc45273375ff4f455b52`, which is byte-identical to the
-benchmarked source tree. [Reproducing](docs/REPRODUCING.md) includes the build
-command and identifies the separately pinned current-master patch tree.
+The earlier nine-patch profile has a one-command builder,
+`scripts/linux/build_public_llamacpp.sh`.
 
-### 3. Run a new hardware recreation
+**Run it on your own hardware.** [Reproducing](docs/REPRODUCING.md) has the
+build command, the exact model file and hash, the opt-in route variables, and
+the required thermal guard. Report a new run as a fresh reproduction attempt.
 
-The public package does not claim a one-command, bit-for-bit replay of the
-historical full campaigns. Those author runs bind exact historical checkout
-identities, binaries, ignored correctness roots, and machine-specific guarded
-telemetry. The raw accepted samples, manifests, protocols, and analysis are
-published; a new hardware run should be reported as a fresh reproduction
-attempt, not as a continuation of an old campaign.
-
-The exact model identity, workload, opt-in route variables, and hardware-safety
-requirements are in [Reproducing](docs/REPRODUCING.md). Every RX 6700 XT GPU
-run must be serialized and guarded with a 174 W run cap, forced PWM 255, a
-95 C junction abort, frequent polling, symmetric cooling, Intel display
-routing, and verified restoration to the 186 W stock cap and automatic fan.
-
-## Final current-master cutline
-
-The final correctness-only cutline used official llama.cpp master
-`0cea36222fe9bac5ebfc45716c9eef11f37046c4`. All ten guarded invocations
-completed and peaked at 45 C. Matched control, candidate-default, and
-candidate-enabled Vulkan outputs were byte-identical for both FA modes, but
-the predeclared CPU-versus-Vulkan numerical gates failed, producing a sealed
-12-failure decision.
-
-Because control and candidate Vulkan outputs were identical, this does not
-show a candidate-caused regression. It does mean the predeclared correctness
-contract did not authorize timing. No current-master performance screen or
-campaign was run, and none of the historical results above may be relabeled as
-current-master performance. The negative summary is included in
-[the compact evidence](release/evidence/negative-results/current-master/llama2/summary.json).
+To regenerate the samples chart above, run `python3 scripts/plot_decode_samples.py`.
 
 ## Repository map
 
-- [`patches/`](patches) contains the checksummed llama.cpp source profiles and
-  preserved upstream license notices.
-- [`scripts/`](scripts) contains patch application, source/build, and
-  deterministic analysis tools.
-- [`release/evidence/`](release/evidence) contains the compact, path-sanitized
-  accepted samples and current-master negative.
-- [`release/protocols/`](release/protocols) contains the dated public
-  scoreboard workload snapshot.
-- [`docs/RESULTS.md`](docs/RESULTS.md),
-  [`docs/METHODOLOGY.md`](docs/METHODOLOGY.md),
-  [`docs/REPRODUCING.md`](docs/REPRODUCING.md), and
-  [`docs/LIMITATIONS.md`](docs/LIMITATIONS.md) define the public claims and
-  their boundaries.
-- [`docs/PUBLIC_RELEASE_MODELS.md`](docs/PUBLIC_RELEASE_MODELS.md) pins the
-  Llama 2 model URL, size, hash, and terms.
+| Path | Contents |
+| --- | --- |
+| [`patches/`](patches) | Checksummed `llama.cpp` patch series and upstream license notices |
+| [`scripts/`](scripts) | Patch application, source build, deterministic analysis, README chart |
+| [`release/evidence/`](release/evidence) | Raw samples, manifests and analysis for both accepted campaigns, plus the current-master negative |
+| [`release/protocols/`](release/protocols) | Dated snapshot of the public scoreboard workload |
+| [`docs/`](docs) | [Results](docs/RESULTS.md), [Methodology](docs/METHODOLOGY.md), [Reproducing](docs/REPRODUCING.md), [Limitations](docs/LIMITATIONS.md), [Model pin](docs/PUBLIC_RELEASE_MODELS.md) |
 
-## Licensing
+## License
 
-The repository's original code and documentation use the
-[MIT License](LICENSE). The patch files preserve upstream llama.cpp copyright
-and licensing notices; this license does not replace upstream licensing or
-model terms. See [Third-party notices](THIRD_PARTY_NOTICES.md). Model weights
-are not included.
+Original code and docs are [MIT](LICENSE). Patch files keep upstream
+`llama.cpp` copyright and license notices; see
+[Third-party notices](THIRD_PARTY_NOTICES.md). Model weights are not included.
